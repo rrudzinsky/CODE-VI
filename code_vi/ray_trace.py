@@ -34,7 +34,7 @@ class RayTracer:
     def generate_smart_spr_source(self, n_sources=5, rays_per_source=20, 
                                   target_optic_name="Lens 2", 
                                   grating_search_bounds=(0.0, 100.0),
-                                  acceptance_angle_range=(-25.0, 25.0),
+                                  acceptance_angle_range=(70.0, 110.0), # Updated default to point UP at lenses
                                   grating_period=10.0,
                                   beam_energy=0.99):
         """
@@ -57,8 +57,11 @@ class RayTracer:
 
         # 2. Find Spatial Extent (Coarse Scan)
         print("   Step 1: Finding valid grating length...")
+        
+        # --- FIX 1: Pass grating_period and beam_energy to get accurate wavelengths ---
         valid_x_min, valid_x_max = self._find_spatial_bounds(
-            target_idx, grating_search_bounds, acceptance_angle_range
+            target_idx, grating_search_bounds, acceptance_angle_range,
+            grating_period, beam_energy
         )
         
         if valid_x_min is None:
@@ -80,8 +83,10 @@ class RayTracer:
         # 4. Angular Optimization Loop
         for i, sx in enumerate(source_positions):
             # A. Find EXACT angular limits for this specific spot
+            # --- FIX 2: Pass grating_period and beam_energy here as well ---
             theta_min, theta_max = self._find_angular_limits_bisection(
-                sx, source_y, target_idx, acceptance_angle_range
+                sx, source_y, target_idx, acceptance_angle_range,
+                grating_period, beam_energy
             )
             
             optimized_sources.append({
@@ -142,127 +147,140 @@ class RayTracer:
 
         print(f"   Done. Generated {len(self._x)} optimized rays.")
         self._sync_to_dataframe()
-
     # ------------------------------------------------------------------
     #   OPTIMIZATION HELPERS (Bisection Logic)
     # ------------------------------------------------------------------
 
-    def _find_spatial_bounds(self, target_idx, search_bounds, ang_range):
+    def _find_spatial_bounds(self, target_idx, search_bounds, ang_range, grating_period, beam_energy):
         """Scans X-axis to find the first and last point that can hit target."""
         probes = np.linspace(search_bounds[0], search_bounds[1], 20)
         valid_indices = []
         
         for x in probes:
-            # Check if ANY angle in range works for this point
-            if self._check_single_point_viability(x, 0.0, target_idx, ang_range):
+            if self._check_single_point_viability(x, 0.0, target_idx, ang_range, grating_period, beam_energy):
                 valid_indices.append(x)
         
         if not valid_indices: return None, None
         return min(valid_indices), max(valid_indices)
 
-    def _find_angular_limits_bisection(self, x, y, target_idx, ang_range):
-        """
-        Uses Binary Search to find the exact cut-on and cut-off angles.
-        Returns (theta_min, theta_max).
-        """
-        # 1. Coarse Sweep to find a "seed" valid angle
-        seeds = np.linspace(ang_range[0], ang_range[1], 15)
-        valid_seed = None
+    def _find_angular_limits_bisection(self, x, y, target_idx, ang_range, grating_period, beam_energy):
+        """Finds the precise Cut-On and Cut-Off angles for a given point."""
+        seeds = np.linspace(ang_range[0], ang_range[1], 40) 
+        results = [self._fast_trace_check(x, y, ang, target_idx, grating_period, beam_energy) for ang in seeds]
         
-        for ang in seeds:
-            if self._fast_trace_check(x, y, ang, target_idx):
-                valid_seed = ang
-                break
-        
-        if valid_seed is None:
-            # Fallback if bisection fails (shouldn't happen if spatial check passed)
+        if not any(results):
             mid = (ang_range[0]+ang_range[1])/2
             return mid, mid
 
-        # 2. Bisect Lower Bound (Between min_range and valid_seed)
-        low = ang_range[0]
-        high = valid_seed
-        for _ in range(10): # 10 steps ~ 0.05 deg precision
-            mid = (low + high) / 2
-            if self._fast_trace_check(x, y, mid, target_idx):
-                high = mid # It works, so the boundary is lower
-            else:
-                low = mid # It fails, so the boundary is higher
-        theta_min = high
-
-        # 3. Bisect Upper Bound (Between valid_seed and max_range)
-        low = valid_seed
-        high = ang_range[1]
-        for _ in range(10):
-            mid = (low + high) / 2
-            if self._fast_trace_check(x, y, mid, target_idx):
-                low = mid # It works, so boundary is higher
-            else:
-                high = mid # Fails, so boundary is lower
-        theta_max = low
+        first_valid_idx = results.index(True)
+        last_valid_idx = len(results) - 1 - results[::-1].index(True)
         
-        return theta_min, theta_max
+        # Refine Lower Bound (Cut-On)
+        if first_valid_idx == 0:
+            theta_min = seeds[0] 
+        else:
+            low = seeds[first_valid_idx - 1]
+            high = seeds[first_valid_idx]
+            for _ in range(10):
+                mid = (low + high) / 2
+                if self._fast_trace_check(x, y, mid, target_idx, grating_period, beam_energy):
+                    high = mid 
+                else:
+                    low = mid 
+            theta_min = high
 
-    def _check_single_point_viability(self, x, y, target_idx, ang_range):
-        """Checks if ANY angle in the range works for this point."""
+        # Refine Upper Bound (Cut-Off)
+        if last_valid_idx == len(seeds) - 1:
+            theta_max = seeds[-1] 
+        else:
+            low = seeds[last_valid_idx]
+            high = seeds[last_valid_idx + 1]
+            for _ in range(10):
+                mid = (low + high) / 2
+                if self._fast_trace_check(x, y, mid, target_idx, grating_period, beam_energy):
+                    low = mid 
+                else:
+                    high = mid 
+            theta_max = low
+            
+        return theta_min, theta_max
+    
+    def _check_single_point_viability(self, x, y, target_idx, ang_range, grating_period, beam_energy):
         test_angles = np.linspace(ang_range[0], ang_range[1], 7)
         for ang in test_angles:
-            if self._fast_trace_check(x, y, ang, target_idx):
+            if self._fast_trace_check(x, y, ang, target_idx, grating_period, beam_energy):
                 return True
         return False
 
-    def _fast_trace_check(self, x, y, angle_deg, target_idx):
+    def _fast_trace_check(self, x, y, angle_deg, target_idx, grating_period, beam_energy):
         """
-        Runs a solitary, lightweight ray trace.
-        Returns True ONLY if it passes through/exits the target.
+        Runs a solitary ray trace with CORRECT wavelengths.
+        Enforces Clear Aperture on EVERY surface it hits.
         """
-        # Reset to single ray
+        rads = np.deg2rad(angle_deg)
+        
+        # CRITICAL FIX 1: Calculate actual SPR wavelength for correct refractive index!
+        wl_mm = grating_period * (1.0/beam_energy - np.cos(rads))
+        
         self._x = np.array([x])
         self._y = np.array([y])
-        self._vx = np.array([np.cos(np.deg2rad(angle_deg))])
-        self._vy = np.array([np.sin(np.deg2rad(angle_deg))])
+        self._vx = np.array([np.cos(rads)])
+        self._vy = np.array([np.sin(rads)])
         
         self._t_total = np.zeros(1)
-        self._wavelength = np.zeros(1)
+        self._wavelength = np.array([wl_mm]) 
         self._active = np.zeros(1, dtype=bool) 
         self._source_id = np.zeros(1, dtype=int)
         self._current_optic_idx = np.zeros(1, dtype=int)
         self._current_surf_in_optic = np.zeros(1, dtype=int)
         self._current_n = np.ones(1)
-        self.history = {0: []} 
+        self.history = {0: [(x, y)]} # Start history tracker
         
-        # Run loop
-        # We use a slightly finer step (10mm) to ensure we don't tunnel through thin optics
-        max_dist = 3000.0 
-        dt = 10.0 
+        max_dist = 4000.0 
+        dt = 50.0 # Fast step, history catches everything
         
-        hit = False
+        # 1. Run the trace until it passes the target or leaves the system
         for _ in range(int(max_dist/dt)):
             self.run_time_step(0, dt) 
-            
-            curr_idx = self._current_optic_idx[0]
-            
-            # --- THE FIX ---
-            # We require the ray to have INCREMENTED PAST the target index.
-            # This means it successfully exited the target optic.
-            if curr_idx > target_idx:
-                hit = True
+            if self._current_optic_idx[0] > target_idx:
                 break
-            
-            # Detector Case: Detectors don't exit (they trap the ray at 999).
-            # If your target is a detector, we check for that specifically.
-            if curr_idx == 999 and target_idx != 999:
-                 # If we hit a detector, did we hit the RIGHT one? 
-                 # Usually detectors are the last element.
-                 # For now, let's assume if it hit a detector, it counts.
-                 hit = True
-                 break
-
-            # Fail Condition: We flew past the end of the element list
-            if curr_idx >= len(self.manager.elements):
+            if self._current_optic_idx[0] >= len(self.manager.elements):
                 break
                 
-        return hit
+        # 2. Did it physically reach the end?
+        if self._current_optic_idx[0] <= target_idx:
+            return False
+
+        # CRITICAL FIX 2: Universal Clear Aperture Enforcement
+        # We look back at every intersection point the ray made.
+        points = self.history[0]
+        point_idx = 1 # Skip the start position
+        
+        for opt_idx in range(target_idx + 1):
+            el = self.manager.elements[opt_idx]
+            ap_radius = el.clear_aperture / 2.0
+            
+            # Setup transformation to optical axis
+            ang_rad = np.deg2rad(el.orientation_angle)
+            tx, ty = -np.sin(ang_rad), np.cos(ang_rad)
+            
+            # Check every surface of this optic
+            num_surfs = len(el.surface_names)
+            for _ in range(num_surfs):
+                if point_idx < len(points):
+                    px, py = points[point_idx]
+                    
+                    # Calculate radial distance perpendicular to optical axis
+                    dx = px - el.x_center
+                    dy = py - el.y_center
+                    radial_dist = abs(dx * tx + dy * ty)
+                    
+                    if radial_dist > ap_radius:
+                        return False # Ray violated clear aperture of Optic #{opt_idx}!
+                    
+                    point_idx += 1
+                    
+        return True
     # ------------------------------------------------------------------
     #   CORE PHYSICS ENGINE (Standard)
     # ------------------------------------------------------------------

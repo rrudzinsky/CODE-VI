@@ -94,7 +94,7 @@ class Draw:
             ax_global.set_xlim(current_view['xlim'])
             ax_global.set_ylim(current_view['ylim'])
             # Use 'box' to force the plot to fill the axes box while keeping aspect equal
-            ax_global.set_aspect('equal', adjustable='box')
+            ax_global.set_aspect('equal', adjustable='datalim')
             ax_pulse.relim(); ax_pulse.autoscale_view()
             
             first_draw[0] = False
@@ -436,7 +436,7 @@ class Draw:
             title_suffix = ""
             if source_id_filter is not None: title_suffix = f" (Source #{source_id_filter})"
             Draw.finalize(ax, title=f"SPR Compressor{title_suffix}", show=show_plot)
-        ax.set_aspect('equal', adjustable='box')
+        ax.set_aspect('equal', adjustable='datalim')
         ax.set_xlabel("Global X [mm]"); ax.set_ylabel("Global Y [mm]")
         return ax
 
