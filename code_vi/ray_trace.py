@@ -219,7 +219,7 @@ class RayTracer:
         """
         rads = np.deg2rad(angle_deg)
         
-        # CRITICAL FIX 1: Calculate actual SPR wavelength for correct refractive index!
+        # Calculate actual SPR wavelength for correct refractive index!
         wl_mm = grating_period * (1.0/beam_energy - np.cos(rads))
         
         self._x = np.array([x])
@@ -239,9 +239,14 @@ class RayTracer:
         max_dist = 4000.0 
         dt = 50.0 # Fast step, history catches everything
         
+        # --- THE FIX: We must advance a fake clock for the new time-stepper ---
+        sim_time = 0.0
+        
         # 1. Run the trace until it passes the target or leaves the system
         for _ in range(int(max_dist/dt)):
-            self.run_time_step(0, dt) 
+            self.run_time_step(sim_time, dt) 
+            sim_time += dt # <--- Clock moves forward!
+            
             if self._current_optic_idx[0] > target_idx:
                 break
             if self._current_optic_idx[0] >= len(self.manager.elements):
@@ -251,8 +256,7 @@ class RayTracer:
         if self._current_optic_idx[0] <= target_idx:
             return False
 
-        # CRITICAL FIX 2: Universal Clear Aperture Enforcement
-        # We look back at every intersection point the ray made.
+        # Universal Clear Aperture Enforcement
         points = self.history[0]
         point_idx = 1 # Skip the start position
         
@@ -286,27 +290,52 @@ class RayTracer:
     # ------------------------------------------------------------------
 
     def run_time_step(self, t_current, dt):
-        activation_mask = (self._t_total <= t_current) & (~self._active)
-        self._active[activation_mask] = True
+        """
+        Advanced time stepper that handles sub-step ray activation.
+        Ensures correct Pulse-Front Tilt even with large dt.
+        """
+        t_end_of_step = t_current + dt
+
+        # 1. Activate rays due within this step window
+        # We use < t_end_of_step to ensure a ray scheduled exactly at the boundary 
+        # is picked up in the *next* step, avoiding double counting.
+        activation_condition = (self._t_total < t_end_of_step) & (~self._active)
+        self._active[activation_condition] = True
         
         if not np.any(self._active): return
         
         active_indices = np.where(self._active)[0]
         remaining_dt = np.zeros(len(self._x))
-        remaining_dt[active_indices] = dt
         
+        # 2. Calculate precise remaining time for this step.
+        # - Rays already running get the full 'dt'.
+        # - Rays just born mid-step only get the time remaining from their birth moment.
+        start_times = self._t_total[active_indices]
+        # The effective start for this step is either the step start time OR the ray's birth time, whichever is later.
+        effective_start_times = np.maximum(start_times, t_current)
+        remaining_dt[active_indices] = t_end_of_step - effective_start_times
+        
+        # Ensure numerical stability (no tiny negative times)
+        remaining_dt[active_indices] = np.maximum(0.0, remaining_dt[active_indices])
+        
+        # 3. Geometric Propagation Loop (Iterative intersection check)
         iteration = 0
         while iteration < 20: 
+            # Only move rays that still have time left in this step
             moving_indices = np.where(remaining_dt > 1e-6)[0]
             if len(moving_indices) == 0: break
             
+            # Get current speeds in medium
             speeds = self.c_mm_ps / self._current_n[moving_indices]
             
-            # --- INTERSECTION LOGIC ---
+            # Check for intersections along the path
             hits, dist_hits, normals, surface_names = self._check_intersections_with_skeleton(moving_indices)
             
-            valid_hit_mask = hits & (dist_hits <= (remaining_dt[moving_indices] * speeds + 1e-7))
+            # A hit is valid only if it occurs WITHIN the remaining time budget
+            max_dist_for_step = remaining_dt[moving_indices] * speeds + 1e-7
+            valid_hit_mask = hits & (dist_hits <= max_dist_for_step)
             
+            # --- Handle HITS (Move to surface, apply physics, update time) ---
             if np.any(valid_hit_mask):
                 local_hit_idx = np.where(valid_hit_mask)[0] 
                 global_hit_idx = moving_indices[local_hit_idx]
@@ -315,10 +344,13 @@ class RayTracer:
                 self._x[global_hit_idx] += self._vx[global_hit_idx] * h_dist
                 self._y[global_hit_idx] += self._vy[global_hit_idx] * h_dist
                 
+                # Calculate time consumed to reach surface
                 t_used = h_dist / speeds[local_hit_idx]
+                # Update ray's absolute clock and subtract from step budget
                 self._t_total[global_hit_idx] += t_used
                 remaining_dt[global_hit_idx] -= t_used
                 
+                # Apply physics (refraction/reflection) at the surface
                 for i, g_idx in enumerate(global_hit_idx):
                     self.history[g_idx].append((self._x[g_idx], self._y[g_idx]))
                     
@@ -328,28 +360,39 @@ class RayTracer:
                     
                     self._apply_physics_numpy(g_idx, (nx, ny), s_name)
 
+            # --- Handle FLYING (Move full remaining distance, finish step) ---
             fly_mask = ~valid_hit_mask
             if np.any(fly_mask):
                 local_fly_idx = np.where(fly_mask)[0]
                 global_fly_idx = moving_indices[local_fly_idx]
+                
                 dist = speeds[local_fly_idx] * remaining_dt[global_fly_idx]
                 self._x[global_fly_idx] += self._vx[global_fly_idx] * dist
                 self._y[global_fly_idx] += self._vy[global_fly_idx] * dist
+                
+                # Update total time and consume rest of budget
                 self._t_total[global_fly_idx] += remaining_dt[global_fly_idx]
                 remaining_dt[global_fly_idx] = 0 
             
             iteration += 1
 
-        # Snapshot Logic
-        has_started = self._t_total > 0
-        if np.any(has_started):
+        # 4. Take Snapshot for Visualization
+        # Only record rays that have actually started moving (t_total > t_delay)
+        # We use a small epsilon to ensure freshly born rays are captured.
+        has_started = self._t_total > (self._wavelength * 0.0 + 1e-9) # Hack to get source-specific delay
+        # Better way: reconstruct delay from source ID? No, t_total is sufficient.
+        # A ray has started if its current t_total is > its initial delay.
+        # Since we overwrite t_total, this is hard to track.
+        # Simpler: Record anything active.
+        
+        if np.any(self._active):
             self.snapshots.append({
-                't': t_current, 
-                'x': self._x[has_started].copy(), 
-                'y': self._y[has_started].copy(),
-                'vx': self._vx[has_started].copy(),
-                'vy': self._vy[has_started].copy(),
-                'ids': np.where(has_started)[0]
+                't': t_end_of_step, # Record at the END of the step
+                'x': self._x[self._active].copy(), 
+                'y': self._y[self._active].copy(),
+                'vx': self._vx[self._active].copy(),
+                'vy': self._vy[self._active].copy(),
+                'ids': np.where(self._active)[0]
             })
 
     def _check_intersections_with_skeleton(self, active_indices):
