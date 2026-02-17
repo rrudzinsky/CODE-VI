@@ -37,7 +37,7 @@ class Draw:
         
         # --- FIX: Adjusted margins (left=0.08, right=0.96) to center the plot and save the Y-axis label ---
         gs = fig.add_gridspec(2, 2, height_ratios=[2, 1], width_ratios=[1.2, 1], 
-                              left=0.08, right=0.96, top=0.95, bottom=0.08, hspace=0.25, wspace=0.2)
+                              left=0.10, right=0.96, top=0.95, bottom=0.10, hspace=0.3, wspace=0.2)
         
         ax_global = fig.add_subplot(gs[0, :])
         ax_pulse = fig.add_subplot(gs[1, 0])
@@ -273,15 +273,9 @@ class Draw:
 
     @staticmethod
     def _analyze_pulse_shape(ax, snap, tracer, source_filter):
-        """
-        Dual-Mode Analysis:
-        1. Single Source: Plots PFT (Time vs Transverse Position).
-        2. All Sources (Integrated): Plots Phase Space (Time vs Wavelength) + Histogram.
-        """
         id_to_source = tracer.rays['source_id'].values
         global_ids = snap['ids']
         
-        # --- 1. FILTER DATA ---
         if source_filter is not None:
             mask = (id_to_source[global_ids] == source_filter)
             mode = "PFT"
@@ -294,35 +288,25 @@ class Draw:
             ax.text(0.5, 0.5, "No active rays", ha='center', va='center')
             return
 
-        # Extract Raw Data
         x, y = snap['x'][indices], snap['y'][indices]
         vx, vy = snap['vx'][indices], snap['vy'][indices]
         wls = tracer.rays['wavelength'][global_ids[indices]].values
-        # Note: In ray_trace.py, t_total is Absolute Time. 
-        # For a pulse duration, we need Relative Arrival Time at the current plane.
-        # We project the ray forward/backward to a common plane perpendicular to the average velocity.
         
         avg_vx, avg_vy = np.mean(vx), np.mean(vy)
         theta = np.arctan2(avg_vy, avg_vx)
         
-        # Centroid
         cx, cy = np.mean(x), np.mean(y)
         dx, dy = x - cx, y - cy
         
-        # Longitudinal coordinate (z_prime) and Transverse (x_prime)
         z_prime = dx * np.cos(theta) + dy * np.sin(theta)
         x_prime = -dx * np.sin(theta) + dy * np.cos(theta)
         
         c_mm_ps = 0.29979
-        # Relative time delay: if z_prime is positive (ahead), it arrived "earlier" (negative delay relative to center)
-        # But usually we map "Space" to "Time" via t = z/c.
         dt_fs = -(z_prime / c_mm_ps) * 1000.0 
         
-        # --- MODE 1: SINGLE SOURCE (PFT ANALYSIS) ---
         if mode == "PFT":
             ax.scatter(x_prime, dt_fs, c=wls, cmap='jet', alpha=0.6, s=15, edgecolors='none')
             try:
-                # Linear Fit for Tilt
                 coeffs = np.polyfit(x_prime, dt_fs, 1)
                 fit_y = np.polyval(coeffs, x_prime)
                 ax.plot(x_prime, fit_y, 'k--', lw=1, alpha=0.5)
@@ -332,37 +316,51 @@ class Draw:
             
             ax.set_xlabel("Transverse Position [mm]")
             ax.set_ylabel("Relative Time [fs]")
-            ax.set_title(f"Pulse Front Tilt (Source #{source_filter})")
+            ax.set_title(f"Pulse Front Tilt (Source #{source_filter})", fontweight='bold')
 
-        # --- MODE 2: ALL SOURCES (COMPRESSION DIAGNOSTIC) ---
         else:
-            # Main Plot: Time vs Wavelength (The "Chirp" Plot)
-            # If this is a diagonal line -> Chirped. If flat -> Compressed.
+            ax.scatter(wls, dt_fs, c='blue', alpha=0.2, s=5)
             
-            # 1. RMS Duration Calculation
-            rms_duration = np.std(dt_fs)
-            
-            # Scatter Plot
-            sc = ax.scatter(wls, dt_fs, c='blue', alpha=0.3, s=5, label='Rays')
-            
-            # Add a trend line (Chirp)
-            try:
-                coeffs = np.polyfit(wls, dt_fs, 2)
-                fit_w = np.linspace(min(wls), max(wls), 50)
-                fit_t = np.polyval(coeffs, fit_w)
-                ax.plot(fit_w, fit_t, 'r-', lw=1.5, alpha=0.8, label='Chirp')
-            except: pass
+            unique_sources = np.unique(id_to_source[global_ids[indices]])
+            if len(unique_sources) > 1:
+                mean_wls = []
+                mean_dts = []
+                
+                for src in unique_sources:
+                    src_mask = (id_to_source[global_ids[indices]] == src)
+                    mean_wls.append(np.mean(wls[src_mask]))
+                    mean_dts.append(np.mean(dt_fs[src_mask]))
+                
+                mean_wls = np.array(mean_wls)
+                mean_dts = np.array(mean_dts)
+                
+                ax.plot(mean_wls, mean_dts, 'ro', markersize=6, alpha=0.8)
+                
+                try:
+                    w_mean, t_mean = np.mean(mean_wls), np.mean(mean_dts)
+                    dw = mean_wls - w_mean
+                    dt = mean_dts - t_mean
+                    
+                    cov = np.cov(dw, dt)
+                    evals, evecs = np.linalg.eig(cov)
+                    
+                    max_eigenval_idx = np.argmax(evals)
+                    vec_w = evecs[0, max_eigenval_idx]
+                    vec_t = evecs[1, max_eigenval_idx]
+                    
+                    projections = dw * vec_w + dt * vec_t
+                    p_min, p_max = np.min(projections), np.max(projections)
+                    
+                    margin = (p_max - p_min) * 0.1
+                    fit_w = w_mean + np.array([p_min - margin, p_max + margin]) * vec_w
+                    fit_t = t_mean + np.array([p_min - margin, p_max + margin]) * vec_t
+                    
+                    ax.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8)
+                except: pass
 
-            # Stats Overlay
-            stats = (f"RMS Duration: {rms_duration:.1f} fs\n"
-                     f"Total Span: {max(dt_fs)-min(dt_fs):.0f} fs")
-            
-            ax.text(0.05, 0.95, stats, transform=ax.transAxes, va='top', 
-                   bbox=dict(facecolor='white', edgecolor='red', alpha=0.9, pad=3))
-            
-            ax.set_xlabel(r"Wavelength [mm]")
+            ax.set_xlabel(r"Wavelength [μm]")
             ax.set_ylabel("Relative Delay [fs]")
-            ax.set_title("Longitudinal Phase Space (Chirp)")
+            ax.set_title("Longitudinal Phase Space (Chirp)", fontweight='bold')
             ax.grid(True, linestyle=':', alpha=0.6)
     
     @staticmethod
@@ -383,20 +381,17 @@ class Draw:
         bw = wls.max() - wls.min()
         mean_wl = np.mean(wls)
         
-        # Defaults for Integrated Mode
         spatial_extent = "View Snapshots"
         rms_dur = "View Snapshots"
-        transmission = "View Snapshots"
+        total_span = "View Snapshots"
         active_count = "N/A"
         
-        # Calculate dynamic metrics if looking at a specific time step
         if snap is not None and len(snap['ids']) > 0:
             global_ids = snap['ids']
             mask = (id_to_source[global_ids] == source_filter) if source_filter is not None else np.ones(len(global_ids), dtype=bool)
             indices = np.where(mask)[0]
             
             active_count = str(len(indices))
-            transmission = f"{(len(indices) / total_rays) * 100:.1f}%"
             
             if len(indices) > 2:
                 x, y = snap['x'][indices], snap['y'][indices]
@@ -411,17 +406,17 @@ class Draw:
                 z_prime = dx * np.cos(theta) + dy * np.sin(theta)
                 dt_fs = -(z_prime / 0.29979) * 1000.0
                 rms_dur = f"{np.std(dt_fs):.1f} fs"
+                total_span = f"{np.max(dt_fs) - np.min(dt_fs):.0f} fs"
                 
-        # Draw the visual table
         ax.set_title("Optical Metrics", fontweight='bold', fontsize=12, loc='left')
         
         labels = [
             "Center Wavelength:", "Total Bandwidth:", "Active Rays:", 
-            "Transmission:", "Transverse Beam Size:", "RMS Pulse Duration:"
+            "Transverse Beam Size:", "RMS Pulse Duration:", "Total Time Span:"
         ]
         values = [
             f"{mean_wl:.3f} μm", f"{bw:.3f} μm", f"{active_count} / {total_rays}", 
-            transmission, spatial_extent, rms_dur
+            spatial_extent, rms_dur, total_span
         ]
         
         y_pos = 0.85
