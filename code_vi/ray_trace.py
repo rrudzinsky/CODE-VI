@@ -491,11 +491,47 @@ class RayTracer:
         nx, ny = normal
         vx, vy = self._vx[idx], self._vy[idx]
         
-        # --- MIRRORS / GRATINGS ---
-        if el.optic_type in ["Mirror", "Grating"]:
+        # --- MIRRORS ---
+        if el.optic_type == "Mirror":
             dot = vx*nx + vy*ny
             self._vx[idx] -= 2*dot*nx
             self._vy[idx] -= 2*dot*ny
+            self._current_optic_idx[idx] += 1
+            self._current_surf_in_optic[idx] = 0
+
+        # --- GRATINGS ---
+        elif el.optic_type == "Grating":
+            dot = vx*nx + vy*ny
+            
+            # Ensure normal points AGAINST the incoming ray
+            if dot > 0:
+                nx, ny = -nx, -ny
+                dot = -dot
+                
+            # Define tangent vector (parallel to grating surface)
+            tx, ty = -ny, nx
+            
+            # Project velocity onto tangent (sin of incident angle)
+            t_in = vx*tx + vy*ty
+            
+            # Fetch Grating properties
+            G = getattr(el, 'groove_density', 0.0)
+            m = getattr(el, 'diffraction_order', 1)
+            
+            # --- CRITICAL FIX: Convert Wavelength from microns to mm! ---
+            wl_mm = self._wavelength[idx] / 1000.0 
+            
+            # Apply Diffraction Equation: sin(Out) = sin(In) + m * lambda * G
+            t_out = t_in + (m * wl_mm * G)
+            
+            # Check if the light is diffracted into an Evanescent wave
+            if abs(t_out) > 1.0:
+                self._active[idx] = False # Ray is lost/absorbed
+            else:
+                n_out = np.sqrt(1.0 - t_out**2)
+                self._vx[idx] = t_out*tx + n_out*nx
+                self._vy[idx] = t_out*ty + n_out*ny
+                
             self._current_optic_idx[idx] += 1
             self._current_surf_in_optic[idx] = 0
             

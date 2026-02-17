@@ -70,6 +70,10 @@ class OpticalElement:
     # --- PRISM SPECIFICS ---
     side_length: float = 0.0
     
+    # --- GRATING SPECIFICS ---
+    groove_density: float = 100.0  # lines per mm
+    diffraction_order: int = 1     # m (+1 or -1 usually)
+    
     # --- INTERNAL DATA (Calculated by system.py) ---
     coords: Dict = field(default_factory=dict)
     surface_names: List[str] = field(default_factory=list)

@@ -22,7 +22,6 @@ class Draw:
 
     @staticmethod
     def interactive_session(manager, tracer, **kwargs):
-        # 1. Validation
         if tracer.rays.empty:
             print("Warning: RayTrace data is empty. Run the simulation first.")
             return
@@ -30,15 +29,20 @@ class Draw:
         n_sources = tracer.rays['source_id'].nunique() if 'source_id' in tracer.rays.columns else 0
         n_time_steps = len(tracer.snapshots)
         
-        # 2. Pre-calculate Global Bounds
         include_beam = kwargs.get('draw_beam_arrow', False)
-        # Use the new helper to get SQUARE limits to prevent aspect ratio crushing
         global_xlim, global_ylim = Draw._get_global_bounds(manager, tracer, include_beam=include_beam)
 
-        # 3. Create Figure
         plt.ioff()
-        fig, axes = plt.subplots(1, 2, figsize=(9.5, 4.5), layout='constrained', gridspec_kw={'width_ratios': [1.5, 1]})
-        ax_global, ax_pulse = axes
+        fig = plt.figure(figsize=(9,9))
+        
+        # --- FIX: Adjusted margins (left=0.08, right=0.96) to center the plot and save the Y-axis label ---
+        gs = fig.add_gridspec(2, 2, height_ratios=[2, 1], width_ratios=[1.2, 1], 
+                              left=0.08, right=0.96, top=0.95, bottom=0.08, hspace=0.25, wspace=0.2)
+        
+        ax_global = fig.add_subplot(gs[0, :])
+        ax_pulse = fig.add_subplot(gs[1, 0])
+        ax_table = fig.add_subplot(gs[1, 1])
+        
         fig.canvas.header_visible = False
         fig.canvas.footer_visible = False
         plt.ion()
@@ -46,10 +50,6 @@ class Draw:
         current_view = {'xlim': global_xlim, 'ylim': global_ylim}
         first_draw = [True]
 
-        # Clear cache
-        Draw._cached_triangles = None
-
-        # 4. Define Update Logic
         def update_dashboard(source_idx, time_idx, show_cloud):
             if not first_draw[0]:
                 current_view['xlim'] = ax_global.get_xlim()
@@ -57,50 +57,47 @@ class Draw:
 
             ax_global.clear()
             ax_pulse.clear()
+            ax_table.clear()
+            ax_table.axis('off')
             
             filter_val = None if source_idx == -1 else source_idx
             
-            # --- MODE 1: INTEGRATED VIEW ---
             if time_idx == -1:
                 Draw.draw_system(manager, tracer=tracer, ax=ax_global, source_id_filter=filter_val, show_plot=False, **kwargs)
-                ax_global.set_title(f"Integrated Path (Source #{filter_val if filter_val is not None else 'All'})")
+                ax_global.set_title(f"Integrated Path (Source #{filter_val if filter_val is not None else 'All'})", fontsize=14, fontweight='bold')
                 
                 if filter_val is not None:
                     Draw._plot_pft_history(ax_pulse, tracer, filter_val)
                 else:
                     ax_pulse.text(0.5, 0.5, "Select a single Source ID\nto see PFT Evolution", ha='center', va='center', color='gray')
                     ax_pulse.set_xlim(0, 100); ax_pulse.set_ylim(-10, 10); ax_pulse.axis('on')
-
-            # --- MODE 2: SNAPSHOT VIEW ---
             else:
                 snap = tracer.snapshots[time_idx]
                 t_current = snap['t']
                 
-                # Draw Geometry
                 Draw.draw_system(manager, ax=ax_global, tracer=None, show_plot=False, **kwargs) 
                 
-                # Draw Cloud
                 if show_cloud:
                     Draw._draw_continuous_cloud(ax_global, snap, tracer, filter_val)
                 else:
                     Draw._draw_photon_cloud_global(ax_global, snap, tracer, filter_val)
                     
-                ax_global.set_title(f"Snapshot @ t={t_current:.1f} ps")
-
-                # Right Panel (Analysis)
+                ax_global.set_title(f"Snapshot @ t={t_current:.1f} ps", fontsize=14, fontweight='bold')
                 Draw._analyze_pulse_shape(ax_pulse, snap, tracer, filter_val)
 
-            # Restore View
+            snap_for_table = tracer.snapshots[time_idx] if time_idx != -1 else None
+            Draw._draw_metrics_table(ax_table, snap_for_table, tracer, filter_val)
+
+            ax_global.set_aspect('equal', adjustable='datalim') 
+            ax_global.autoscale(False)
             ax_global.set_xlim(current_view['xlim'])
             ax_global.set_ylim(current_view['ylim'])
-            # Use 'box' to force the plot to fill the axes box while keeping aspect equal
-            ax_global.set_aspect('equal', adjustable='datalim')
+            
             ax_pulse.relim(); ax_pulse.autoscale_view()
             
             first_draw[0] = False
             fig.canvas.draw_idle()
 
-        # 5. Controls
         s_source = widgets.IntSlider(min=-1, max=n_sources-1, step=1, value=0, description='Source ID:')
         s_time = widgets.IntSlider(min=-1, max=n_time_steps-1, step=1, value=-1, description='Time Step:')
         c_cloud = widgets.Checkbox(value=False, description='Show Interpolated Cloud')
@@ -367,10 +364,75 @@ class Draw:
             ax.set_ylabel("Relative Delay [fs]")
             ax.set_title("Longitudinal Phase Space (Chirp)")
             ax.grid(True, linestyle=':', alpha=0.6)
+    
+    @staticmethod
+    def _draw_metrics_table(ax, snap, tracer, source_filter):
+        """Calculates and displays a text-based metrics table on the provided axis."""
+        id_to_source = tracer.rays['source_id'].values
+        total_rays = len(np.where(id_to_source == source_filter)[0]) if source_filter is not None else len(id_to_source)
+        
+        if total_rays == 0:
+            ax.text(0.5, 0.5, "No Ray Data", ha='center', va='center')
+            return
             
-            # Optional: Histogram on side (conceptually)
-            # For now, just the phase space is dense enough information.
-
+        if source_filter is not None:
+            wls = tracer.rays['wavelength'][id_to_source == source_filter].values
+        else:
+            wls = tracer.rays['wavelength'].values
+            
+        bw = wls.max() - wls.min()
+        mean_wl = np.mean(wls)
+        
+        # Defaults for Integrated Mode
+        spatial_extent = "View Snapshots"
+        rms_dur = "View Snapshots"
+        transmission = "View Snapshots"
+        active_count = "N/A"
+        
+        # Calculate dynamic metrics if looking at a specific time step
+        if snap is not None and len(snap['ids']) > 0:
+            global_ids = snap['ids']
+            mask = (id_to_source[global_ids] == source_filter) if source_filter is not None else np.ones(len(global_ids), dtype=bool)
+            indices = np.where(mask)[0]
+            
+            active_count = str(len(indices))
+            transmission = f"{(len(indices) / total_rays) * 100:.1f}%"
+            
+            if len(indices) > 2:
+                x, y = snap['x'][indices], snap['y'][indices]
+                vx, vy = snap['vx'][indices], snap['vy'][indices]
+                
+                theta = np.arctan2(np.mean(vy), np.mean(vx))
+                dx, dy = x - np.mean(x), y - np.mean(y)
+                
+                x_prime = -dx * np.sin(theta) + dy * np.cos(theta)
+                spatial_extent = f"{np.max(x_prime) - np.min(x_prime):.2f} mm"
+                
+                z_prime = dx * np.cos(theta) + dy * np.sin(theta)
+                dt_fs = -(z_prime / 0.29979) * 1000.0
+                rms_dur = f"{np.std(dt_fs):.1f} fs"
+                
+        # Draw the visual table
+        ax.set_title("Optical Metrics", fontweight='bold', fontsize=12, loc='left')
+        
+        labels = [
+            "Center Wavelength:", "Total Bandwidth:", "Active Rays:", 
+            "Transmission:", "Transverse Beam Size:", "RMS Pulse Duration:"
+        ]
+        values = [
+            f"{mean_wl:.3f} μm", f"{bw:.3f} μm", f"{active_count} / {total_rays}", 
+            transmission, spatial_extent, rms_dur
+        ]
+        
+        y_pos = 0.85
+        for lbl, val in zip(labels, values):
+            ax.text(0.05, y_pos, lbl, ha='left', va='center', fontsize=10, fontweight='bold', color='#333333')
+            ax.text(0.95, y_pos, val, ha='right', va='center', fontsize=10, color='blue')
+            y_pos -= 0.15
+            
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        
     @staticmethod
     def _plot_pft_history(ax, tracer, source_filter):
         times, tilts = [], []
@@ -404,10 +466,11 @@ class Draw:
     @staticmethod
     def draw_system(manager, ax=None, tracer=None, draw_labels=True, show_skeleton=True, show_curvature=True, show_focus=True, auto_dimension=True, draw_beam_arrow=False, show_intersection_points=False, source_id_filter=None, show_plot=True, dimension_overrides=None, label_overrides=None):
         if ax is None: 
-            fig, ax = plt.subplots(figsize=(8, 6), layout='constrained', dpi=120)
+            fig, ax = plt.subplots(figsize=(10, 8), dpi=120) # Removed layout='constrained' here too
         if dimension_overrides is None: dimension_overrides = {}
         if label_overrides is None: label_overrides = {}
         ax.grid(False) 
+        
         for opt in manager.elements:
             mat_color = MaterialLib.get_color(opt.material)
             Draw._draw_optic_shape(ax, opt, mat_color)
@@ -419,6 +482,7 @@ class Draw:
             else:
                 if show_curvature: Draw._draw_curvature_spokes(ax, opt)
                 if show_focus: Draw._draw_focal_spokes(ax, opt)
+                
         if auto_dimension and len(manager.elements) > 1:
             for i in range(len(manager.elements) - 1):
                 opt_a = manager.elements[i]
@@ -426,7 +490,9 @@ class Draw:
                 gap_key = f"{opt_a.name}->{opt_b.name}"
                 offset = dimension_overrides.get(gap_key, 25)
                 if offset is not None: Draw.draw_dimension(ax, opt_a, opt_b, offset=offset)
+                
         if draw_beam_arrow: Draw.draw_electron_beam(ax, angle=0.0)
+        
         if tracer:
             if tracer.rays.empty and hasattr(tracer, '_sync_to_dataframe'): tracer._sync_to_dataframe()
             mappable = Draw.draw_rays(ax, tracer, lw=0.8, alpha=0.5, source_filter=source_id_filter)
@@ -436,15 +502,19 @@ class Draw:
             title_suffix = ""
             if source_id_filter is not None: title_suffix = f" (Source #{source_id_filter})"
             Draw.finalize(ax, title=f"SPR Compressor{title_suffix}", show=show_plot)
-        ax.set_aspect('equal', adjustable='datalim')
+            
+        ax.set_aspect('equal', adjustable='datalim') 
         ax.set_xlabel("Global X [mm]"); ax.set_ylabel("Global Y [mm]")
         return ax
 
     @staticmethod
     def add_colorbar(ax, mappable, label="Wavelength [um]"):
         if mappable and ax.figure:
-            if not any(hasattr(a, 'get_label') and a.get_label() == '<colorbar>' for a in ax.figure.axes):
-                 ax.figure.colorbar(mappable, ax=ax, label=label, shrink=0.8, aspect=30)
+            # Check if a colorbar already exists to prevent duplicate drawing
+            if not any(a.get_label() == '<colorbar>' for a in ax.figure.axes):
+                # FIX: Removed 'shrink', added 'fraction' and 'aspect' to make it perfectly fill the Y-height
+                cb = ax.figure.colorbar(mappable, ax=ax, label=label, fraction=0.025, pad=0.02, aspect=35)
+                cb.ax.set_label('<colorbar>') # Tag it so it doesn't duplicate on UI updates
 
     @staticmethod
     def finalize(ax, title="SPR Compressor", show=True):
@@ -591,15 +661,17 @@ class Draw:
                 xs = np.concatenate([opt.coords["Front"]["skeleton_x"], opt.coords["Back"]["skeleton_x"][::-1]])
                 ys = np.concatenate([opt.coords["Front"]["skeleton_y"], opt.coords["Back"]["skeleton_y"][::-1]])
                 ax.add_patch(Polygon(np.column_stack([xs, ys]), closed=True, facecolor=mat_color, edgecolor='black', linewidth=1.5, alpha=0.5))
+        
         elif opt.optic_type in ["Mirror", "Grating"]:
-            if all(s in opt.coords for s in ["Front", "Interface", "Back"]):
-                xs_sub = np.concatenate([opt.coords["Interface"]["skeleton_x"], opt.coords["Back"]["skeleton_x"][::-1]])
-                ys_sub = np.concatenate([opt.coords["Interface"]["skeleton_y"], opt.coords["Back"]["skeleton_y"][::-1]])
-                ax.add_patch(Polygon(np.column_stack([xs_sub, ys_sub]), closed=True, facecolor='#404040', edgecolor='black', linewidth=1.5))
-                coat_color = "lightsteelblue" if opt.optic_type == "Grating" else mat_color
-                xs_coat = np.concatenate([opt.coords["Front"]["skeleton_x"], opt.coords["Interface"]["skeleton_x"][::-1]])
-                ys_coat = np.concatenate([opt.coords["Front"]["skeleton_y"], opt.coords["Interface"]["skeleton_y"][::-1]])
-                ax.add_patch(Polygon(np.column_stack([xs_coat, ys_coat]), closed=True, facecolor=coat_color, edgecolor='black', linewidth=1.0))
+            if "Front" in opt.coords and "Back" in opt.coords:
+                # 1. Draw the BODY as dark gray always
+                xs_body = np.concatenate([opt.coords["Front"]["skeleton_x"], opt.coords["Back"]["skeleton_x"][::-1]])
+                ys_body = np.concatenate([opt.coords["Front"]["skeleton_y"], opt.coords["Back"]["skeleton_y"][::-1]])
+                ax.add_patch(Polygon(np.column_stack([xs_body, ys_body]), closed=True, facecolor='#404040', edgecolor='black', linewidth=1.5))
+                
+                # 2. Draw the SURFACE COATING as a thick line (using your Material Color!)
+                ax.plot(opt.coords["Front"]["skeleton_x"], opt.coords["Front"]["skeleton_y"], color=mat_color, linewidth=3, zorder=2)
+                
         elif opt.optic_type == "Prism":
             if "Vertices" in opt.coords:
                 ax.add_patch(Polygon(np.column_stack([opt.coords["Vertices"]["x"], opt.coords["Vertices"]["y"]]), closed=True, facecolor=mat_color, edgecolor='black', linewidth=1.5, alpha=0.5))
@@ -609,7 +681,6 @@ class Draw:
             if "Front" in opt.coords:
                 ax.plot(opt.coords["Front"]["skeleton_x"], opt.coords["Front"]["skeleton_y"], color="lime", linewidth=2)
                 ax.plot(opt.x_center, opt.y_center, 'x', color='red')
-
     @staticmethod
     def _draw_skeleton_dots(ax, opt):
         allowed_surfaces = []
