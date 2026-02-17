@@ -319,49 +319,54 @@ class Draw:
             ax.set_title(f"Pulse Front Tilt (Source #{source_filter})", fontweight='bold')
 
         else:
+            # 1. Plot the raw ray data
             ax.scatter(wls, dt_fs, c='blue', alpha=0.2, s=5)
             
-            unique_sources = np.unique(id_to_source[global_ids[indices]])
-            if len(unique_sources) > 1:
-                mean_wls = []
-                mean_dts = []
+            # --- 2. TRUE MACROSCOPIC CHIRP (Wavelength Binning) ---
+            n_bins = 12
+            valid_centers = []
+            mean_dts = []
+            if wls.max() > wls.min():
+                bins = np.linspace(wls.min(), wls.max(), n_bins + 1)
+                bin_centers = 0.5 * (bins[1:] + bins[:-1])
                 
-                for src in unique_sources:
-                    src_mask = (id_to_source[global_ids[indices]] == src)
-                    mean_wls.append(np.mean(wls[src_mask]))
-                    mean_dts.append(np.mean(dt_fs[src_mask]))
+                # Calculate the exact center of mass for each COLOR
+                for i in range(n_bins):
+                    bin_mask = (wls >= bins[i]) & (wls <= bins[i+1])
+                    if np.sum(bin_mask) >= 2: 
+                        mean_dts.append(np.mean(dt_fs[bin_mask]))
+                        valid_centers.append(bin_centers[i])
                 
-                mean_wls = np.array(mean_wls)
+                valid_centers = np.array(valid_centers)
                 mean_dts = np.array(mean_dts)
-                
-                ax.plot(mean_wls, mean_dts, 'ro', markersize=6, alpha=0.8)
-                
-                try:
-                    w_mean, t_mean = np.mean(mean_wls), np.mean(mean_dts)
-                    dw = mean_wls - w_mean
-                    dt = mean_dts - t_mean
-                    
-                    cov = np.cov(dw, dt)
-                    evals, evecs = np.linalg.eig(cov)
-                    
-                    max_eigenval_idx = np.argmax(evals)
-                    vec_w = evecs[0, max_eigenval_idx]
-                    vec_t = evecs[1, max_eigenval_idx]
-                    
-                    projections = dw * vec_w + dt * vec_t
-                    p_min, p_max = np.min(projections), np.max(projections)
-                    
-                    margin = (p_max - p_min) * 0.1
-                    fit_w = w_mean + np.array([p_min - margin, p_max + margin]) * vec_w
-                    fit_t = t_mean + np.array([p_min - margin, p_max + margin]) * vec_t
-                    
-                    ax.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8)
-                except: pass
+
+                if len(valid_centers) > 1:
+                    # Plot the wavelength centroids
+                    ax.plot(valid_centers, mean_dts, 'ro', markersize=6, alpha=0.8)
+                    try:
+                        # Draw the linear chirp fit
+                        coeffs = np.polyfit(valid_centers, mean_dts, 1)
+                        fit_w = np.linspace(min(valid_centers), max(valid_centers), 50)
+                        fit_t = np.polyval(coeffs, fit_w)
+                        ax.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8)
+                    except: pass
 
             ax.set_xlabel(r"Wavelength [μm]")
             ax.set_ylabel("Relative Delay [fs]")
             ax.set_title("Longitudinal Phase Space (Chirp)", fontweight='bold')
             ax.grid(True, linestyle=':', alpha=0.6)
+            
+            # --- FIX: Add padding to BOTH axes so no dots are cut off ---
+            if len(wls) > 0 and len(dt_fs) > 0:
+                w_span = wls.max() - wls.min()
+                t_span = dt_fs.max() - dt_fs.min()
+                
+                # Use a minimum padding if the span is near zero to avoid singular limits
+                w_pad = w_span * 0.1 if w_span > 1e-9 else 0.1
+                t_pad = t_span * 0.1 if t_span > 1e-9 else 10.0
+                
+                ax.set_xlim(wls.min() - w_pad, wls.max() + w_pad)
+                ax.set_ylim(dt_fs.min() - t_pad, dt_fs.max() + t_pad)
     
     @staticmethod
     def _draw_metrics_table(ax, snap, tracer, source_filter):
