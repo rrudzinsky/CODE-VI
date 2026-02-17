@@ -33,15 +33,14 @@ class Draw:
         global_xlim, global_ylim = Draw._get_global_bounds(manager, tracer, include_beam=include_beam)
 
         plt.ioff()
-        fig = plt.figure(figsize=(9,9))
-        
-        # --- FIX: Adjusted margins (left=0.08, right=0.96) to center the plot and save the Y-axis label ---
-        gs = fig.add_gridspec(2, 2, height_ratios=[2, 1], width_ratios=[1.2, 1], 
-                              left=0.10, right=0.96, top=0.95, bottom=0.10, hspace=0.3, wspace=0.2)
+        fig = plt.figure(figsize=(9, 9)) 
+
+        gs = fig.add_gridspec(2, 2, height_ratios=[2, 1], width_ratios=[1, 1], 
+                              left=0.12, right=0.90, top=0.95, bottom=0.10, hspace=0.3, wspace=0.35)
         
         ax_global = fig.add_subplot(gs[0, :])
-        ax_pulse = fig.add_subplot(gs[1, 0])
-        ax_table = fig.add_subplot(gs[1, 1])
+        ax_chirp = fig.add_subplot(gs[1, 0])
+        ax_pft = fig.add_subplot(gs[1, 1])
         
         fig.canvas.header_visible = False
         fig.canvas.footer_visible = False
@@ -56,9 +55,8 @@ class Draw:
                 current_view['ylim'] = ax_global.get_ylim()
 
             ax_global.clear()
-            ax_pulse.clear()
-            ax_table.clear()
-            ax_table.axis('off')
+            ax_chirp.clear()
+            ax_pft.clear()
             
             filter_val = None if source_idx == -1 else source_idx
             
@@ -67,10 +65,11 @@ class Draw:
                 ax_global.set_title(f"Integrated Path (Source #{filter_val if filter_val is not None else 'All'})", fontsize=14, fontweight='bold')
                 
                 if filter_val is not None:
-                    Draw._plot_pft_history(ax_pulse, tracer, filter_val)
+                    Draw._plot_pft_history(ax_pft, tracer, filter_val)
+                    ax_chirp.text(0.5, 0.5, "Select Time Step for Chirp", ha='center', va='center')
                 else:
-                    ax_pulse.text(0.5, 0.5, "Select a single Source ID\nto see PFT Evolution", ha='center', va='center', color='gray')
-                    ax_pulse.set_xlim(0, 100); ax_pulse.set_ylim(-10, 10); ax_pulse.axis('on')
+                    ax_pft.text(0.5, 0.5, "Select Time Step for Spatial Front", ha='center', va='center')
+                    ax_chirp.text(0.5, 0.5, "Select Time Step for Chirp", ha='center', va='center')
             else:
                 snap = tracer.snapshots[time_idx]
                 t_current = snap['t']
@@ -83,29 +82,31 @@ class Draw:
                     Draw._draw_photon_cloud_global(ax_global, snap, tracer, filter_val)
                     
                 ax_global.set_title(f"Snapshot @ t={t_current:.1f} ps", fontsize=14, fontweight='bold')
-                Draw._analyze_pulse_shape(ax_pulse, snap, tracer, filter_val)
+                Draw._analyze_pulse_shape(ax_chirp, ax_pft, snap, tracer, filter_val)
 
+            # --- FIX: Overlay metrics directly onto the global axis ---
             snap_for_table = tracer.snapshots[time_idx] if time_idx != -1 else None
-            Draw._draw_metrics_table(ax_table, snap_for_table, tracer, filter_val)
+            Draw._draw_metrics_overlay(ax_global, snap_for_table, tracer, filter_val)
 
             ax_global.set_aspect('equal', adjustable='datalim') 
             ax_global.autoscale(False)
             ax_global.set_xlim(current_view['xlim'])
             ax_global.set_ylim(current_view['ylim'])
             
-            ax_pulse.relim(); ax_pulse.autoscale_view()
+            ax_chirp.relim(); ax_chirp.autoscale_view()
+            ax_pft.relim(); ax_pft.autoscale_view()
             
             first_draw[0] = False
             fig.canvas.draw_idle()
 
-        s_source = widgets.IntSlider(min=-1, max=n_sources-1, step=1, value=0, description='Source ID:')
-        s_time = widgets.IntSlider(min=-1, max=n_time_steps-1, step=1, value=-1, description='Time Step:')
+        s_source = widgets.IntSlider(min=-1, max=n_sources-1, step=1, value=-1, description='Source ID:', layout=widgets.Layout(width='100%'))
+        s_time = widgets.IntSlider(min=-1, max=n_time_steps-1, step=1, value=-1, description='Time Step:', layout=widgets.Layout(width='100%'))
         c_cloud = widgets.Checkbox(value=False, description='Show Interpolated Cloud')
         
         ui = widgets.interactive(update_dashboard, source_idx=s_source, time_idx=s_time, show_cloud=c_cloud)
         
         display(widgets.VBox([
-            widgets.HBox([s_source, s_time]),
+            widgets.HBox([s_source, s_time], layout=widgets.Layout(width='100%')),
             c_cloud,
             fig.canvas
         ]))
@@ -272,20 +273,24 @@ class Draw:
             ax.quiver(cx, cy, mvx, mvy, color='black', scale=20, width=0.005, zorder=11, alpha=0.6)
 
     @staticmethod
-    def _analyze_pulse_shape(ax, snap, tracer, source_filter):
+    def _analyze_pulse_shape(ax_chirp, ax_pft, snap, tracer, source_filter):
         id_to_source = tracer.rays['source_id'].values
         global_ids = snap['ids']
         
+        # Explicitly define the titles
         if source_filter is not None:
             mask = (id_to_source[global_ids] == source_filter)
-            mode = "PFT"
+            pft_title = f"Pulse Front Tilt (Source #{source_filter})"
+            chirp_title = f"Longitudinal Chirp (Source #{source_filter})"
         else:
             mask = np.ones(len(global_ids), dtype=bool)
-            mode = "PHASE_SPACE"
+            pft_title = "Pulse Front Tilt"
+            chirp_title = "Longitudinal Chirp"
             
         indices = np.where(mask)[0]
         if len(indices) < 5: 
-            ax.text(0.5, 0.5, "No active rays", ha='center', va='center')
+            ax_chirp.text(0.5, 0.5, "No active rays", ha='center', va='center')
+            ax_pft.text(0.5, 0.5, "No active rays", ha='center', va='center')
             return
 
         x, y = snap['x'][indices], snap['y'][indices]
@@ -303,79 +308,100 @@ class Draw:
         
         c_mm_ps = 0.29979
         dt_fs = -(z_prime / c_mm_ps) * 1000.0 
+
+        # --- PLOT 1: SPATIAL FRONT (PFT & CURVATURE) ---
+        ax_pft.scatter(x_prime, dt_fs, c=wls, cmap='jet', alpha=0.6, s=15, edgecolors='none')
         
-        if mode == "PFT":
-            ax.scatter(x_prime, dt_fs, c=wls, cmap='jet', alpha=0.6, s=15, edgecolors='none')
+        x_range = x_prime.max() - x_prime.min()
+        if x_range > 1e-4:
             try:
-                coeffs = np.polyfit(x_prime, dt_fs, 1)
-                fit_y = np.polyval(coeffs, x_prime)
-                ax.plot(x_prime, fit_y, 'k--', lw=1, alpha=0.5)
-                ax.text(0.05, 0.95, f"Tilt: {coeffs[0]:.1f} fs/mm", 
-                       transform=ax.transAxes, va='top', bbox=dict(facecolor='white', alpha=0.7))
-            except: pass
-            
-            ax.set_xlabel("Transverse Position [mm]")
-            ax.set_ylabel("Relative Time [fs]")
-            ax.set_title(f"Pulse Front Tilt (Source #{source_filter})", fontweight='bold')
-
+                # Multivariate Regression (Iso-Wavelength Fit)
+                A = np.vstack([x_prime**2, x_prime, wls, np.ones(len(x_prime))]).T
+                coeffs, _, _, _ = np.linalg.lstsq(A, dt_fs, rcond=None)
+                
+                curv = coeffs[0]       # fs/mm^2 (Spatial Curvature)
+                tilt = coeffs[1]       # fs/mm   (Iso-Wavelength PFT)
+                wl_chirp = coeffs[2]   # fs/um   (Linear Wavelength Delay)
+                intercept = coeffs[3]
+                
+                # Convert fs/mm to Physical Degrees
+                c_mm_fs = 0.00029979
+                tilt_deg = np.degrees(np.arctan(tilt * c_mm_fs))
+                
+                # Draw the specific curve for the MEAN wavelength
+                center_wl = np.mean(wls)
+                fit_x = np.linspace(x_prime.min(), x_prime.max(), 50)
+                fit_y = curv * fit_x**2 + tilt * fit_x + wl_chirp * center_wl + intercept
+                
+                # --- FIX: Clean legend containing only the degrees ---
+                stats_text = f"Tilt: {tilt_deg:.2f}°"
+                ax_pft.plot(fit_x, fit_y, 'k--', lw=2, alpha=0.8, label=stats_text)
+                
+                ax_pft.legend(loc='best', fontsize=10, framealpha=0.85, edgecolor='#cccccc')
+                
+            except: 
+                ax_pft.text(0.05, 0.95, "Fit Failed", transform=ax_pft.transAxes, va='top', bbox=dict(facecolor='white', alpha=0.8))
         else:
-            # 1. Plot the raw ray data
-            ax.scatter(wls, dt_fs, c='blue', alpha=0.2, s=5)
-            
-            # --- 2. TRUE MACROSCOPIC CHIRP (Wavelength Binning) ---
-            n_bins = 12
-            valid_centers = []
-            mean_dts = []
-            if wls.max() > wls.min():
-                bins = np.linspace(wls.min(), wls.max(), n_bins + 1)
-                bin_centers = 0.5 * (bins[1:] + bins[:-1])
-                
-                # Calculate the exact center of mass for each COLOR
-                for i in range(n_bins):
-                    bin_mask = (wls >= bins[i]) & (wls <= bins[i+1])
-                    if np.sum(bin_mask) >= 2: 
-                        mean_dts.append(np.mean(dt_fs[bin_mask]))
-                        valid_centers.append(bin_centers[i])
-                
-                valid_centers = np.array(valid_centers)
-                mean_dts = np.array(mean_dts)
+             ax_pft.text(0.05, 0.95, "Beam too narrow to fit", transform=ax_pft.transAxes, va='top', bbox=dict(facecolor='white', alpha=0.8))
+        
+        ax_pft.set_xlabel("Transverse Position [mm]")
+        ax_pft.set_ylabel("Relative Time [fs]")
+        ax_pft.set_title(pft_title, fontweight='bold')
+        ax_pft.grid(True, linestyle=':', alpha=0.6)
+        
+        x_pad = x_range * 0.15 if x_range > 1e-9 else 0.1
+        y_span = dt_fs.max() - dt_fs.min()
+        y_pad = y_span * 0.15 if y_span > 1e-9 else 10.0
+        ax_pft.set_xlim(x_prime.min() - x_pad, x_prime.max() + x_pad)
+        ax_pft.set_ylim(dt_fs.min() - y_pad, dt_fs.max() + y_pad)
 
-                if len(valid_centers) > 1:
-                    # Plot the wavelength centroids
-                    ax.plot(valid_centers, mean_dts, 'ro', markersize=6, alpha=0.8)
-                    try:
-                        # Draw the linear chirp fit
-                        coeffs = np.polyfit(valid_centers, mean_dts, 1)
-                        fit_w = np.linspace(min(valid_centers), max(valid_centers), 50)
-                        fit_t = np.polyval(coeffs, fit_w)
-                        ax.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8)
-                    except: pass
-
-            ax.set_xlabel(r"Wavelength [μm]")
-            ax.set_ylabel("Relative Delay [fs]")
-            ax.set_title("Longitudinal Phase Space (Chirp)", fontweight='bold')
-            ax.grid(True, linestyle=':', alpha=0.6)
+        # --- PLOT 2: LONGITUDINAL CHIRP ---
+        ax_chirp.scatter(wls, dt_fs, c='blue', alpha=0.2, s=5)
+        
+        n_bins = 12
+        valid_centers, mean_dts = [], []
+        if wls.max() > wls.min():
+            bins = np.linspace(wls.min(), wls.max(), n_bins + 1)
+            bin_centers = 0.5 * (bins[1:] + bins[:-1])
             
-            # --- FIX: Add padding to BOTH axes so no dots are cut off ---
-            if len(wls) > 0 and len(dt_fs) > 0:
-                w_span = wls.max() - wls.min()
-                t_span = dt_fs.max() - dt_fs.min()
-                
-                # Use a minimum padding if the span is near zero to avoid singular limits
-                w_pad = w_span * 0.1 if w_span > 1e-9 else 0.1
-                t_pad = t_span * 0.1 if t_span > 1e-9 else 10.0
-                
-                ax.set_xlim(wls.min() - w_pad, wls.max() + w_pad)
-                ax.set_ylim(dt_fs.min() - t_pad, dt_fs.max() + t_pad)
+            for i in range(n_bins):
+                bin_mask = (wls >= bins[i]) & (wls <= bins[i+1])
+                if np.sum(bin_mask) >= 2: 
+                    mean_dts.append(np.mean(dt_fs[bin_mask]))
+                    valid_centers.append(bin_centers[i])
+            
+            valid_centers, mean_dts = np.array(valid_centers), np.array(mean_dts)
+
+            if len(valid_centers) > 1:
+                ax_chirp.plot(valid_centers, mean_dts, 'ro', markersize=6, alpha=0.8)
+                try:
+                    coeffs = np.polyfit(valid_centers, mean_dts, 1)
+                    fit_w = np.linspace(min(valid_centers), max(valid_centers), 50)
+                    fit_t = np.polyval(coeffs, fit_w)
+                    ax_chirp.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8)
+                except: pass
+
+        ax_chirp.set_xlabel(r"Wavelength [μm]")
+        ax_chirp.set_ylabel("Relative Delay [fs]")
+        ax_chirp.set_title(chirp_title, fontweight='bold')
+        ax_chirp.grid(True, linestyle=':', alpha=0.6)
+
+        if len(wls) > 0 and len(dt_fs) > 0:
+            w_span = wls.max() - wls.min()
+            t_span = dt_fs.max() - dt_fs.min()
+            w_pad = w_span * 0.1 if w_span > 1e-9 else 0.1
+            t_pad = t_span * 0.1 if t_span > 1e-9 else 10.0
+            
+            ax_chirp.set_xlim(wls.min() - w_pad, wls.max() + w_pad)
+            ax_chirp.set_ylim(dt_fs.min() - t_pad, dt_fs.max() + t_pad)
     
     @staticmethod
-    def _draw_metrics_table(ax, snap, tracer, source_filter):
-        """Calculates and displays a text-based metrics table on the provided axis."""
+    def _draw_metrics_overlay(ax, snap, tracer, source_filter):
+        """Calculates and displays a text-based metrics overlay directly on the global axis."""
         id_to_source = tracer.rays['source_id'].values
         total_rays = len(np.where(id_to_source == source_filter)[0]) if source_filter is not None else len(id_to_source)
         
         if total_rays == 0:
-            ax.text(0.5, 0.5, "No Ray Data", ha='center', va='center')
             return
             
         if source_filter is not None:
@@ -413,25 +439,21 @@ class Draw:
                 rms_dur = f"{np.std(dt_fs):.1f} fs"
                 total_span = f"{np.max(dt_fs) - np.min(dt_fs):.0f} fs"
                 
-        ax.set_title("Optical Metrics", fontweight='bold', fontsize=12, loc='left')
+        metrics_text = (
+            f"Optical Metrics:\n"
+            f"--------------------------\n"
+            f"Center WL: {mean_wl:.3f} μm\n"
+            f"Bandwidth: {bw:.3f} μm\n"
+            f"Active Rays: {active_count} / {total_rays}\n"
+            f"Beam Size: {spatial_extent}\n"
+            f"RMS Duration: {rms_dur}\n"
+            f"Total Span: {total_span}"
+        )
         
-        labels = [
-            "Center Wavelength:", "Total Bandwidth:", "Active Rays:", 
-            "Transverse Beam Size:", "RMS Pulse Duration:", "Total Time Span:"
-        ]
-        values = [
-            f"{mean_wl:.3f} μm", f"{bw:.3f} μm", f"{active_count} / {total_rays}", 
-            spatial_extent, rms_dur, total_span
-        ]
-        
-        y_pos = 0.85
-        for lbl, val in zip(labels, values):
-            ax.text(0.05, y_pos, lbl, ha='left', va='center', fontsize=10, fontweight='bold', color='#333333')
-            ax.text(0.95, y_pos, val, ha='right', va='center', fontsize=10, color='blue')
-            y_pos -= 0.15
-            
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
+        # Place it in the top-left corner of the global plot
+        ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes, 
+                fontsize=9, va='top', ha='left', family='monospace',
+                bbox=dict(facecolor='white', alpha=0.85, edgecolor='#cccccc', boxstyle='round,pad=0.5', zorder=20))
         
     @staticmethod
     def _plot_pft_history(ax, tracer, source_filter):

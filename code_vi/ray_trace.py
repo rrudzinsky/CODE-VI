@@ -109,7 +109,7 @@ class RayTracer:
             ang_span = theta_max - theta_min
             
             # Smart Ray Count: If span is tiny, just shoot 1 ray to avoid waste
-            if ang_span < 0.05:
+            if ang_span < 1e-6:
                 angles = np.array([(theta_min + theta_max)/2])
                 n_rays_here = 1
             else:
@@ -538,7 +538,7 @@ class RayTracer:
         # --- LENSES (Sequential) & PRISMS (Non-Sequential) ---
         elif el.optic_type in ["Lens", "Prism"]:
             n1 = self._current_n[idx]
-            wl_microns = self._wavelength[idx] * 1000.0
+            wl_microns = self._wavelength[idx]
             
             if n1 < 1.01:
                 n2 = MaterialLib.get_index(el.material, wl_microns)
