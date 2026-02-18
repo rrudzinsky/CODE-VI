@@ -108,8 +108,8 @@ class Draw:
                 
                 # Add "(Final)" tag to titles if in Integrated mode
                 if display_mode == "Integrated":
-                    ax_pft.set_title(ax_pft.get_title() + " (Final)")
-                    ax_chirp.set_title(ax_chirp.get_title() + " (Final)")
+                    if ax_pft.get_title(): ax_pft.set_title(ax_pft.get_title() + " (Final)")
+                    if ax_chirp.get_title(): ax_chirp.set_title(ax_chirp.get_title() + " (Final)")
             else:
                 ax_pft.text(0.5, 0.5, "No Data", ha='center')
                 ax_chirp.text(0.5, 0.5, "No Data", ha='center')
@@ -180,16 +180,32 @@ class Draw:
         all_x = tracer.rays['x'].values.copy()
         all_y = tracer.rays['y'].values.copy()
         active_ids = snap['ids']
+        
+        # SAFETY CHECK 1: Ensure we don't write out of bounds
+        max_len = len(all_x)
+        if np.any(active_ids >= max_len):
+            return # Should not happen unless rays were deleted
+
         all_x[active_ids] = snap['x']
         all_y[active_ids] = snap['y']
         
         try:
             triangles = Draw._get_structured_topology(tracer)
+            
+            # SAFETY CHECK 2: Filter out triangles that reference non-existent rays
+            # This fixes the "index 62 is out of bounds" error if some rays are missing
+            valid_mask = (triangles[:, 0] < max_len) & \
+                         (triangles[:, 1] < max_len) & \
+                         (triangles[:, 2] < max_len)
+            triangles = triangles[valid_mask]
+            
+            if len(triangles) == 0: return
+
         except:
             return 
             
         # Masking
-        is_active = np.zeros(len(tracer.rays), dtype=bool)
+        is_active = np.zeros(max_len, dtype=bool)
         is_active[active_ids] = True
         
         if source_filter is not None:
@@ -311,19 +327,29 @@ class Draw:
         id_to_source = tracer.rays['source_id'].values
         global_ids = snap['ids']
         
-        # Explicitly define the titles
+        # --- Logic for Single Source vs All Sources ---
         if source_filter is not None:
+            # SINGLE SOURCE MODE
             mask = (id_to_source[global_ids] == source_filter)
-            pft_title = f"Pulse Front Tilt (Source #{source_filter})"
-            chirp_title = f"Longitudinal Chirp (Source #{source_filter})"
+            pft_title = f"Pulse Front Curvature (Source #{source_filter})"
+            
+            # Blank out the chirp plot
+            ax_chirp.clear()
+            ax_chirp.text(0.5, 0.5, "Not Applicable for Point Source", ha='center', va='center')
+            ax_chirp.set_title("Longitudinal Chirp (N/A)", fontweight='bold')
+            ax_chirp.axis('off') 
+            chirp_mode = False
         else:
+            # ALL SOURCES MODE
             mask = np.ones(len(global_ids), dtype=bool)
             pft_title = "Pulse Front Tilt"
             chirp_title = "Longitudinal Chirp"
+            ax_chirp.axis('on') 
+            chirp_mode = True
             
         indices = np.where(mask)[0]
         if len(indices) < 5: 
-            ax_chirp.text(0.5, 0.5, "No active rays", ha='center', va='center')
+            if chirp_mode: ax_chirp.text(0.5, 0.5, "No active rays", ha='center', va='center')
             ax_pft.text(0.5, 0.5, "No active rays", ha='center', va='center')
             return
 
@@ -345,38 +371,50 @@ class Draw:
 
         # --- PLOT 1: SPATIAL FRONT (PFT & CURVATURE) ---
         ax_pft.scatter(x_prime, dt_fs, c=wls, cmap='jet', alpha=0.6, s=15, edgecolors='none')
-        
         x_range = x_prime.max() - x_prime.min()
+        
         if x_range > 1e-4:
             try:
-                # Multivariate Regression (Iso-Wavelength Fit)
-                A = np.vstack([x_prime**2, x_prime, wls, np.ones(len(x_prime))]).T
-                coeffs, _, _, _ = np.linalg.lstsq(A, dt_fs, rcond=None)
-                
-                curv = coeffs[0]       # fs/mm^2 (Spatial Curvature)
-                tilt = coeffs[1]       # fs/mm   (Iso-Wavelength PFT)
-                wl_chirp = coeffs[2]   # fs/um   (Linear Wavelength Delay)
-                intercept = coeffs[3]
-                
-                # Convert fs/mm to Physical Degrees
-                c_mm_fs = 0.00029979
-                tilt_deg = np.degrees(np.arctan(tilt * c_mm_fs))
-                
-                # Draw the specific curve for the MEAN wavelength
-                center_wl = np.mean(wls)
-                fit_x = np.linspace(x_prime.min(), x_prime.max(), 50)
-                fit_y = curv * fit_x**2 + tilt * fit_x + wl_chirp * center_wl + intercept
-                
-                # --- FIX: Clean legend containing only the degrees ---
-                stats_text = f"Tilt: {tilt_deg:.2f}°"
+                if source_filter is not None:
+                    # --- METHOD A: SINGLE SOURCE (1D Polynomial Fit) ---
+                    # Better for seeing pure curvature when bandwidth is narrow
+                    coeffs = np.polyfit(x_prime, dt_fs, 2)
+                    curv = coeffs[0]       
+                    tilt = coeffs[1]       
+                    intercept = coeffs[2]
+                    
+                    fit_x = np.linspace(x_prime.min(), x_prime.max(), 50)
+                    fit_y = np.polyval(coeffs, fit_x)
+                    
+                    stats_text = f"Curvature: {curv:.2f} fs/mm²"
+                    
+                else:
+                    # --- METHOD B: ALL SOURCES (Multivariate Regression) ---
+                    # Crucial for isolating Geometric Tilt from Chromatic Chirp
+                    A = np.vstack([x_prime**2, x_prime, wls, np.ones(len(x_prime))]).T
+                    coeffs, _, _, _ = np.linalg.lstsq(A, dt_fs, rcond=None)
+                    
+                    curv = coeffs[0]       # fs/mm^2 
+                    tilt = coeffs[1]       # fs/mm (Pure Iso-Wavelength Tilt)
+                    wl_chirp = coeffs[2]   # fs/um (Chromatic Delay)
+                    intercept = coeffs[3]
+                    
+                    center_wl = np.mean(wls)
+                    fit_x = np.linspace(x_prime.min(), x_prime.max(), 50)
+                    # We plot the curve as if all rays were at the CENTER wavelength
+                    fit_y = curv * fit_x**2 + tilt * fit_x + wl_chirp * center_wl + intercept
+                    
+                    c_mm_fs = 0.00029979
+                    tilt_deg = np.degrees(np.arctan(tilt * c_mm_fs))
+                    stats_text = f"Tilt: {tilt_deg:.2f}°"
+
                 ax_pft.plot(fit_x, fit_y, 'k--', lw=2, alpha=0.8, label=stats_text)
-                
                 ax_pft.legend(loc='best', fontsize=10, framealpha=0.85, edgecolor='#cccccc')
                 
             except: 
                 ax_pft.text(0.05, 0.95, "Fit Failed", transform=ax_pft.transAxes, va='top', bbox=dict(facecolor='white', alpha=0.8))
         else:
-             ax_pft.text(0.05, 0.95, "Beam too narrow to fit", transform=ax_pft.transAxes, va='top', bbox=dict(facecolor='white', alpha=0.8))
+             ax_pft.text(0.05, 0.95, "Beam too narrow", transform=ax_pft.transAxes, va='top', bbox=dict(facecolor='white', alpha=0.8))
         
         ax_pft.set_xlabel("Transverse Position [mm]")
         ax_pft.set_ylabel("Relative Time [fs]")
@@ -389,45 +427,46 @@ class Draw:
         ax_pft.set_xlim(x_prime.min() - x_pad, x_prime.max() + x_pad)
         ax_pft.set_ylim(dt_fs.min() - y_pad, dt_fs.max() + y_pad)
 
-        # --- PLOT 2: LONGITUDINAL CHIRP ---
-        ax_chirp.scatter(wls, dt_fs, c='blue', alpha=0.2, s=5)
-        
-        n_bins = 12
-        valid_centers, mean_dts = [], []
-        if wls.max() > wls.min():
-            bins = np.linspace(wls.min(), wls.max(), n_bins + 1)
-            bin_centers = 0.5 * (bins[1:] + bins[:-1])
+        # --- PLOT 2: LONGITUDINAL CHIRP (Only if active) ---
+        if chirp_mode:
+            ax_chirp.scatter(wls, dt_fs, c='blue', alpha=0.2, s=5)
             
-            for i in range(n_bins):
-                bin_mask = (wls >= bins[i]) & (wls <= bins[i+1])
-                if np.sum(bin_mask) >= 2: 
-                    mean_dts.append(np.mean(dt_fs[bin_mask]))
-                    valid_centers.append(bin_centers[i])
-            
-            valid_centers, mean_dts = np.array(valid_centers), np.array(mean_dts)
+            n_bins = 12
+            valid_centers, mean_dts = [], []
+            if wls.max() > wls.min():
+                bins = np.linspace(wls.min(), wls.max(), n_bins + 1)
+                bin_centers = 0.5 * (bins[1:] + bins[:-1])
+                
+                for i in range(n_bins):
+                    bin_mask = (wls >= bins[i]) & (wls <= bins[i+1])
+                    if np.sum(bin_mask) >= 2: 
+                        mean_dts.append(np.mean(dt_fs[bin_mask]))
+                        valid_centers.append(bin_centers[i])
+                
+                valid_centers, mean_dts = np.array(valid_centers), np.array(mean_dts)
 
-            if len(valid_centers) > 1:
-                ax_chirp.plot(valid_centers, mean_dts, 'ro', markersize=6, alpha=0.8)
-                try:
-                    coeffs = np.polyfit(valid_centers, mean_dts, 1)
-                    fit_w = np.linspace(min(valid_centers), max(valid_centers), 50)
-                    fit_t = np.polyval(coeffs, fit_w)
-                    ax_chirp.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8)
-                except: pass
+                if len(valid_centers) > 1:
+                    ax_chirp.plot(valid_centers, mean_dts, 'ro', markersize=6, alpha=0.8)
+                    try:
+                        coeffs = np.polyfit(valid_centers, mean_dts, 1)
+                        fit_w = np.linspace(min(valid_centers), max(valid_centers), 50)
+                        fit_t = np.polyval(coeffs, fit_w)
+                        ax_chirp.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8)
+                    except: pass
 
-        ax_chirp.set_xlabel(r"Wavelength [μm]")
-        ax_chirp.set_ylabel("Relative Delay [fs]")
-        ax_chirp.set_title(chirp_title, fontweight='bold')
-        ax_chirp.grid(True, linestyle=':', alpha=0.6)
+            ax_chirp.set_xlabel(r"Wavelength [μm]")
+            ax_chirp.set_ylabel("Relative Delay [fs]")
+            ax_chirp.set_title(chirp_title, fontweight='bold')
+            ax_chirp.grid(True, linestyle=':', alpha=0.6)
 
-        if len(wls) > 0 and len(dt_fs) > 0:
-            w_span = wls.max() - wls.min()
-            t_span = dt_fs.max() - dt_fs.min()
-            w_pad = w_span * 0.1 if w_span > 1e-9 else 0.1
-            t_pad = t_span * 0.1 if t_span > 1e-9 else 10.0
-            
-            ax_chirp.set_xlim(wls.min() - w_pad, wls.max() + w_pad)
-            ax_chirp.set_ylim(dt_fs.min() - t_pad, dt_fs.max() + t_pad)
+            if len(wls) > 0 and len(dt_fs) > 0:
+                w_span = wls.max() - wls.min()
+                t_span = dt_fs.max() - dt_fs.min()
+                w_pad = w_span * 0.1 if w_span > 1e-9 else 0.1
+                t_pad = t_span * 0.1 if t_span > 1e-9 else 10.0
+                
+                ax_chirp.set_xlim(wls.min() - w_pad, wls.max() + w_pad)
+                ax_chirp.set_ylim(dt_fs.min() - t_pad, dt_fs.max() + t_pad)
     
     @staticmethod
     def _draw_metrics_overlay(ax, snap, tracer, source_filter):
