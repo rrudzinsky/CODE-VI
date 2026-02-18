@@ -2,12 +2,14 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
-import matplotlib.tri as mtri
+# import matplotlib.tri as mtri # REMOVED: No longer needed for smooth cloud
 from matplotlib.collections import LineCollection
 import numpy as np
 import pandas as pd
 import ipywidgets as widgets
 from IPython.display import display
+from scipy.stats import linregress
+from scipy.interpolate import griddata # <--- NEW IMPORT for smoother clouds
 from .materials import MaterialLib
 
 class Draw:
@@ -16,7 +18,7 @@ class Draw:
     Features: Dual-Panel Interactive Dashboard, PFT Analysis, Fixed Axes, and High-Res Interpolated Cloud.
     """
     
-    # Cache for the structured mesh topology
+    # Cache for the structured mesh topology (Legacy, kept for structure but unused in smooth render)
     _cached_triangles = None
     _cached_ray_count = 0
 
@@ -44,26 +46,46 @@ class Draw:
         ax_chirp = fig.add_subplot(gs[1, 0])
         ax_pft = fig.add_subplot(gs[1, 1])
         
+        # Disable mouse interaction on diagnostics (Zoom/Pan won't work on them, which is good)
+        ax_chirp.set_navigate(False)
+        ax_pft.set_navigate(False)
+        
         fig.canvas.header_visible = False
         fig.canvas.footer_visible = False
         plt.ion()
 
-        # Define Sliders & Controls FIRST
+        # --- THE FIX: MONKEY-PATCH THE TOOLBAR HOME BUTTON ---
+        # We define a custom function that ONLY resets ax_global
+        def custom_home_action(*args, **kwargs):
+            ax_global.set_xlim(global_xlim)
+            ax_global.set_ylim(global_ylim)
+            ax_global.set_aspect('equal', adjustable='datalim')
+            fig.canvas.draw_idle()
+            # Note: We intentionally do NOT touch ax_chirp or ax_pft here.
+            
+        # Apply the patch to the toolbar instance
+        try:
+            if fig.canvas.toolbar:
+                fig.canvas.toolbar.home = custom_home_action
+        except Exception:
+            pass # Toolbar might not exist in some backends
+
+        # Define Sliders & Controls
         s_source = widgets.IntSlider(min=-1, max=n_sources-1, step=1, value=-1, description='Source ID:', layout=widgets.Layout(width='100%'))
         s_time = widgets.IntSlider(min=-1, max=n_time_steps-1, step=1, value=-1, description='Time Step:', layout=widgets.Layout(width='100%'))
-        c_cloud = widgets.Checkbox(value=False, description='Show Interpolated Cloud')
+        c_cloud = widgets.Checkbox(value=False, description='Show Smooth Cloud')
 
-        # State to track view zooming
+        # State tracking
         current_view = {'xlim': global_xlim, 'ylim': global_ylim}
         first_draw = [True]
 
         def update_dashboard(change=None):
-            # Read values directly from the widgets
+            # Read values
             source_idx = s_source.value
             time_idx = s_time.value
             show_cloud = c_cloud.value
 
-            # Preserve zoom level unless it's the very first render
+            # Persist Zoom (only for Global Plot)
             if not first_draw[0]:
                 current_view['xlim'] = ax_global.get_xlim()
                 current_view['ylim'] = ax_global.get_ylim()
@@ -74,39 +96,29 @@ class Draw:
             
             filter_val = None if source_idx == -1 else source_idx
             
-            # --- LOGIC: Integrated (-1) vs Specific Time ---
+            # --- RENDER LOGIC ---
             if time_idx == -1:
-                # INTEGRATED VIEW: Show full ray paths + Analysis of the FINAL snapshot
                 display_mode = "Integrated"
                 snap_to_analyze = tracer.snapshots[-1] if len(tracer.snapshots) > 0 else None
-                
-                # Draw full rays
                 Draw.draw_system(manager, tracer=tracer, ax=ax_global, source_id_filter=filter_val, show_plot=False, **kwargs)
                 title_src = f"Source #{filter_val}" if filter_val is not None else "All Sources"
                 ax_global.set_title(f"Integrated Path ({title_src})", fontsize=14, fontweight='bold')
-                
             else:
-                # SNAPSHOT VIEW: Show specific cloud + Analysis of THAT snapshot
                 display_mode = "Snapshot"
                 snap_to_analyze = tracer.snapshots[time_idx]
                 t_current = snap_to_analyze['t']
-                
-                # Draw system geometry only (no rays)
                 Draw.draw_system(manager, ax=ax_global, tracer=None, show_plot=False, **kwargs) 
                 
-                # Draw cloud
                 if show_cloud:
-                    Draw._draw_continuous_cloud(ax_global, snap_to_analyze, tracer, filter_val)
+                    Draw._draw_smooth_cloud(ax_global, snap_to_analyze, tracer, filter_val)
                 else:
                     Draw._draw_photon_cloud_global(ax_global, snap_to_analyze, tracer, filter_val)
                     
                 ax_global.set_title(f"Snapshot @ t={t_current:.1f} ps", fontsize=14, fontweight='bold')
 
-            # --- DIAGNOSTICS: Always Plot (using either current or final snap) ---
+            # --- DIAGNOSTICS ---
             if snap_to_analyze:
                 Draw._analyze_pulse_shape(ax_chirp, ax_pft, snap_to_analyze, tracer, filter_val)
-                
-                # Add "(Final)" tag to titles if in Integrated mode
                 if display_mode == "Integrated":
                     if ax_pft.get_title(): ax_pft.set_title(ax_pft.get_title() + " (Final)")
                     if ax_chirp.get_title(): ax_chirp.set_title(ax_chirp.get_title() + " (Final)")
@@ -114,133 +126,85 @@ class Draw:
                 ax_pft.text(0.5, 0.5, "No Data", ha='center')
                 ax_chirp.text(0.5, 0.5, "No Data", ha='center')
 
-            # --- METRICS: Overlay text on global plot ---
             Draw._draw_metrics_overlay(ax_global, snap_to_analyze, tracer, filter_val)
 
-            # Restore View
+            # --- RESTORE VIEW ---
             ax_global.set_aspect('equal', adjustable='datalim') 
             ax_global.autoscale(False)
             ax_global.set_xlim(current_view['xlim'])
             ax_global.set_ylim(current_view['ylim'])
             
+            # Autoscale diagnostics (since we cleared them, this resets them to data)
             ax_chirp.relim(); ax_chirp.autoscale_view()
             ax_pft.relim(); ax_pft.autoscale_view()
             
             first_draw[0] = False
             fig.canvas.draw_idle()
 
-        # Connect Observers (The robust way to handle updates)
+        # Connect Observers
         s_source.observe(update_dashboard, names='value')
         s_time.observe(update_dashboard, names='value')
         c_cloud.observe(update_dashboard, names='value')
         
-        # Display the UI
         display(widgets.VBox([
             widgets.HBox([s_source, s_time], layout=widgets.Layout(width='100%')),
             c_cloud,
             fig.canvas
         ]))
         
-        # --- FIX: MANUALLY TRIGGER THE FIRST UPDATE ---
-        # This guarantees the plot is drawn immediately after display
         update_dashboard()
-
+        
     # ------------------------------------------------------------------
-    #   STRUCTURED CLOUD RENDERING
+    #   NEW: SMOOTH GRID INTERPOLATION
     # ------------------------------------------------------------------
-
     @staticmethod
-    def _get_structured_topology(tracer):
-        if Draw._cached_triangles is not None and Draw._cached_ray_count == len(tracer.rays):
-            return Draw._cached_triangles
-
-        df = tracer.rays.copy()
-        counts = df['source_id'].value_counts()
-        rays_per_source = counts.mode()[0] if counts.nunique() > 1 else counts.iloc[0]
-        n_sources = df['source_id'].nunique()
+    def _draw_smooth_cloud(ax, snap, tracer, source_filter):
+        """Renders the photon cloud using smooth cubic interpolation on a grid."""
+        if len(snap['ids']) < 4: return
         
-        triangles = []
-        for s in range(n_sources - 1):
-            base_curr = s * rays_per_source
-            base_next = (s + 1) * rays_per_source
-            for r in range(rays_per_source - 1):
-                p00, p01 = base_curr + r, base_curr + r + 1  
-                p10, p11 = base_next + r, base_next + r + 1  
-                triangles.append([p00, p10, p11])
-                triangles.append([p00, p11, p01])
-                
-        Draw._cached_triangles = np.array(triangles)
-        Draw._cached_ray_count = len(tracer.rays)
-        return Draw._cached_triangles
-
-    @staticmethod
-    def _draw_continuous_cloud(ax, snap, tracer, source_filter):
-        if len(snap['ids']) < 3: return
-        
-        all_x = tracer.rays['x'].values.copy()
-        all_y = tracer.rays['y'].values.copy()
-        active_ids = snap['ids']
-        
-        # SAFETY CHECK 1: Ensure we don't write out of bounds
-        max_len = len(all_x)
-        if np.any(active_ids >= max_len):
-            return # Should not happen unless rays were deleted
-
-        all_x[active_ids] = snap['x']
-        all_y[active_ids] = snap['y']
-        
-        try:
-            triangles = Draw._get_structured_topology(tracer)
-            
-            # SAFETY CHECK 2: Filter out triangles that reference non-existent rays
-            # This fixes the "index 62 is out of bounds" error if some rays are missing
-            valid_mask = (triangles[:, 0] < max_len) & \
-                         (triangles[:, 1] < max_len) & \
-                         (triangles[:, 2] < max_len)
-            triangles = triangles[valid_mask]
-            
-            if len(triangles) == 0: return
-
-        except:
-            return 
-            
-        # Masking
-        is_active = np.zeros(max_len, dtype=bool)
-        is_active[active_ids] = True
+        id_to_source = tracer.rays['source_id'].values
+        all_wls = tracer.rays['wavelength'].values
+        global_ids = snap['ids']
         
         if source_filter is not None:
-            is_visible_source = (tracer.rays['source_id'].values == source_filter)
-            is_active = is_active & is_visible_source
+            mask = (id_to_source[global_ids] == source_filter)
+            indices = np.where(mask)[0]
+        else:
+            indices = range(len(global_ids))
             
-        mask = ~ (is_active[triangles[:,0]] & is_active[triangles[:,1]] & is_active[triangles[:,2]])
-
-        # Triangulation
-        triang = mtri.Triangulation(all_x, all_y, triangles=triangles)
-        triang.set_mask(mask)
+        if len(indices) < 4: return
         
-        wls = tracer.rays['wavelength'].values
+        active_ids = global_ids[indices]
+        x = snap['x'][indices]
+        y = snap['y'][indices]
+        wls = all_wls[active_ids]
+        
+        # 1. Define Grid
+        # Add small padding to prevent cutoffs
+        pad_x = (x.max() - x.min()) * 0.05
+        pad_y = (y.max() - y.min()) * 0.05
+        xi = np.linspace(x.min() - pad_x, x.max() + pad_x, 150) # 150x150 resolution
+        yi = np.linspace(y.min() - pad_y, y.max() + pad_y, 150)
+        Xi, Yi = np.meshgrid(xi, yi)
+        
+        # 2. Interpolate Wavelengths onto Grid
+        # 'cubic' gives the smoothest look. 'linear' is faster but pointier.
+        try:
+            zi = griddata((x, y), wls, (Xi, Yi), method='cubic')
+        except:
+            return # Not enough points for cubic
+
+        # 3. Plot Contours
         norm = mcolors.Normalize(vmin=wls.min(), vmax=wls.max())
-        cmap = cm.get_cmap('jet')
+        # Use contourf for smooth filled color
+        ax.contourf(Xi, Yi, zi, levels=100, cmap='jet', norm=norm, alpha=0.8, extend='both')
         
-        ax.tripcolor(triang, wls, norm=norm, cmap=cmap, shading='gouraud', alpha=0.8)
+        # 4. Add Mean Velocity Vector
+        vx, vy = snap['vx'][indices], snap['vy'][indices]
+        cx, cy = np.mean(x), np.mean(y)
+        mvx, mvy = np.mean(vx), np.mean(vy)
+        ax.quiver(cx, cy, mvx, mvy, color='black', scale=20, width=0.005, zorder=11, alpha=0.8)
 
-        # Add velocity
-        if np.any(is_active):
-            id_to_source = tracer.rays['source_id'].values
-            snap_global_ids = snap['ids']
-            if source_filter is not None:
-                subset_mask = (id_to_source[snap_global_ids] == source_filter)
-            else:
-                subset_mask = np.ones(len(snap_global_ids), dtype=bool)
-            
-            if np.any(subset_mask):
-                sx = snap['x'][subset_mask]
-                sy = snap['y'][subset_mask]
-                svx = snap['vx'][subset_mask]
-                svy = snap['vy'][subset_mask]
-                cx, cy = np.mean(sx), np.mean(sy)
-                mvx, mvy = np.mean(svx), np.mean(svy)
-                ax.quiver(cx, cy, mvx, mvy, color='black', scale=20, width=0.005, zorder=11, alpha=0.8)
 
     # ------------------------------------------------------------------
     #   DISCRETE & HELPERS
@@ -248,21 +212,15 @@ class Draw:
     
     @staticmethod
     def _get_global_bounds(manager, tracer, padding=0.1, include_beam=False):
-        """
-        Calculates a SQUARED bounding box containing all elements.
-        Ensures the X and Y ranges are equal so 'equal' aspect ratio doesn't shrink the plot.
-        """
+        """Calculates a SQUARED bounding box containing all elements."""
         xs, ys = [], []
-        # Optics
         for opt in manager.elements:
             r = opt.diameter / 2
             xs.extend([opt.x_center - r, opt.x_center + r])
             ys.extend([opt.y_center - r, opt.y_center + r])
-        # Rays
         if not tracer.rays.empty:
             xs.extend([tracer.rays['x'].min(), tracer.rays['x'].max()])
             ys.extend([tracer.rays['y'].min(), tracer.rays['y'].max()])
-        # Beam
         if include_beam:
             xs.extend([0, 25.4]); ys.extend([-10, 5])
         
@@ -271,18 +229,10 @@ class Draw:
         xmin, xmax = min(xs), max(xs)
         ymin, ymax = min(ys), max(ys)
         
-        # Calculate ranges
         width = xmax - xmin
         height = ymax - ymin
-        
-        # Determine the larger dimension to make it square
         max_dim = max(width, height)
-        
-        # Center points
-        cx = (xmin + xmax) / 2
-        cy = (ymin + ymax) / 2
-        
-        # Create square bounds with padding
+        cx, cy = (xmin + xmax) / 2, (ymin + ymax) / 2
         half_span = (max_dim / 2) * (1 + padding)
         
         return (cx - half_span, cx + half_span), (cy - half_span, cy + half_span)
@@ -332,34 +282,27 @@ class Draw:
             # SINGLE SOURCE MODE
             mask = (id_to_source[global_ids] == source_filter)
             pft_title = f"Pulse Front Curvature (Source #{source_filter})"
-            
-            # Blank out the chirp plot
-            ax_chirp.clear()
-            ax_chirp.text(0.5, 0.5, "Not Applicable for Point Source", ha='center', va='center')
-            ax_chirp.set_title("Longitudinal Chirp (N/A)", fontweight='bold')
-            ax_chirp.axis('off') 
+            ax_chirp.clear(); ax_chirp.text(0.5, 0.5, "N/A for Point Source", ha='center'); ax_chirp.axis('off')
             chirp_mode = False
         else:
             # ALL SOURCES MODE
             mask = np.ones(len(global_ids), dtype=bool)
-            pft_title = "Pulse Front Tilt"
-            chirp_title = "Longitudinal Chirp"
+            pft_title = "Pulse Front Tilt (w/ Spatial Chirp)"
+            chirp_title = "Longitudinal Chirp (De-Tilted)"
             ax_chirp.axis('on') 
             chirp_mode = True
             
         indices = np.where(mask)[0]
         if len(indices) < 5: 
-            if chirp_mode: ax_chirp.text(0.5, 0.5, "No active rays", ha='center', va='center')
-            ax_pft.text(0.5, 0.5, "No active rays", ha='center', va='center')
+            if chirp_mode: ax_chirp.text(0.5, 0.5, "No active rays", ha='center'); ax_pft.text(0.5, 0.5, "No active rays", ha='center')
             return
 
+        # 1. Get Raw Data in Local Coordinates
         x, y = snap['x'][indices], snap['y'][indices]
         vx, vy = snap['vx'][indices], snap['vy'][indices]
         wls = tracer.rays['wavelength'][global_ids[indices]].values
         
-        avg_vx, avg_vy = np.mean(vx), np.mean(vy)
-        theta = np.arctan2(avg_vy, avg_vx)
-        
+        theta = np.arctan2(np.mean(vy), np.mean(vx))
         cx, cy = np.mean(x), np.mean(y)
         dx, dy = x - cx, y - cy
         
@@ -368,58 +311,77 @@ class Draw:
         
         c_mm_ps = 0.29979
         dt_fs = -(z_prime / c_mm_ps) * 1000.0 
-
-        # --- PLOT 1: SPATIAL FRONT (PFT & CURVATURE) ---
-        ax_pft.scatter(x_prime, dt_fs, c=wls, cmap='jet', alpha=0.6, s=15, edgecolors='none')
         x_range = x_prime.max() - x_prime.min()
+
+        # 2. Perform Fit (Logic Split: Linear vs Quadratic)
+        tilt_val = 0.0
+        wl_chirp_val = 0.0
+        fit_success = False
+        
+        # --- PLOT 1: SPATIAL FRONT (PFT) ---
+        ax_pft.scatter(x_prime, dt_fs, c=wls, cmap='jet', alpha=0.6, s=15, edgecolors='none')
         
         if x_range > 1e-4:
             try:
+                stats_text = ""
+                
                 if source_filter is not None:
-                    # --- METHOD A: SINGLE SOURCE (1D Polynomial Fit) ---
-                    # Better for seeing pure curvature when bandwidth is narrow
+                    # === SINGLE SOURCE: QUADRATIC FIT ===
+                    # Use standard 1D polyfit (Degree 2)
                     coeffs = np.polyfit(x_prime, dt_fs, 2)
-                    curv = coeffs[0]       
-                    tilt = coeffs[1]       
-                    intercept = coeffs[2]
+                    curv, tilt_val, intercept = coeffs[0], coeffs[1], coeffs[2]
                     
                     fit_x = np.linspace(x_prime.min(), x_prime.max(), 50)
                     fit_y = np.polyval(coeffs, fit_x)
                     
                     stats_text = f"Curvature: {curv:.2f} fs/mm²"
-                    
+                    fit_success = True # Single source doesn't populate global chirp vars, but that's ok (chirp plot is off)
+
                 else:
-                    # --- METHOD B: ALL SOURCES (Multivariate Regression) ---
-                    # Crucial for isolating Geometric Tilt from Chromatic Chirp
-                    A = np.vstack([x_prime**2, x_prime, wls, np.ones(len(x_prime))]).T
+                    # === ALL SOURCES: LINEAR FIT ===
+                    # Use Multivariate Linear Regression (drop x^2 term)
+                    # Model: dt = Tilt*x + Chirp*lambda + Offset
+                    A = np.vstack([x_prime, wls, np.ones(len(x_prime))]).T
                     coeffs, _, _, _ = np.linalg.lstsq(A, dt_fs, rcond=None)
                     
-                    curv = coeffs[0]       # fs/mm^2 
-                    tilt = coeffs[1]       # fs/mm (Pure Iso-Wavelength Tilt)
-                    wl_chirp = coeffs[2]   # fs/um (Chromatic Delay)
-                    intercept = coeffs[3]
+                    tilt_val = coeffs[0]      # fs/mm
+                    wl_chirp_val = coeffs[1]  # fs/um
+                    intercept = coeffs[2]
                     
+                    # Plot Linear Fit (at center wavelength)
                     center_wl = np.mean(wls)
                     fit_x = np.linspace(x_prime.min(), x_prime.max(), 50)
-                    # We plot the curve as if all rays were at the CENTER wavelength
-                    fit_y = curv * fit_x**2 + tilt * fit_x + wl_chirp * center_wl + intercept
+                    fit_y = tilt_val * fit_x + wl_chirp_val * center_wl + intercept
                     
+                    # Calculate Stats
                     c_mm_fs = 0.00029979
-                    tilt_deg = np.degrees(np.arctan(tilt * c_mm_fs))
-                    stats_text = f"Tilt: {tilt_deg:.2f}°"
+                    tilt_deg = np.degrees(np.arctan(tilt_val * c_mm_fs))
+                    
+                    # Calculate Spatial Dispersion (for legend)
+                    spat_chirp_val = 0.0
+                    active_sids = id_to_source[global_ids[indices]]
+                    total_slope, count = 0.0, 0
+                    for sid in np.unique(active_sids):
+                        s_mask = (active_sids == sid)
+                        if np.sum(s_mask) > 2 and (wls[s_mask].max() - wls[s_mask].min()) > 1e-6:
+                             total_slope += abs(linregress(wls[s_mask], x_prime[s_mask])[0])
+                             count += 1
+                    if count > 0: spat_chirp_val = total_slope / count
+                    
+                    stats_text = f"Tilt: {tilt_deg:.2f}°\nDispersion: {spat_chirp_val:.2f} mm/μm"
+                    fit_success = True
 
-                ax_pft.plot(fit_x, fit_y, 'k--', lw=2, alpha=0.8, label=stats_text)
-                ax_pft.legend(loc='best', fontsize=10, framealpha=0.85, edgecolor='#cccccc')
-                
+                # Draw the line
+                ax_pft.plot(fit_x, fit_y, 'k--', lw=2, label=stats_text)
+                ax_pft.legend(loc='best', fontsize=9, framealpha=0.85)
+
             except: 
                 ax_pft.text(0.05, 0.95, "Fit Failed", transform=ax_pft.transAxes, va='top', bbox=dict(facecolor='white', alpha=0.8))
         else:
              ax_pft.text(0.05, 0.95, "Beam too narrow", transform=ax_pft.transAxes, va='top', bbox=dict(facecolor='white', alpha=0.8))
         
-        ax_pft.set_xlabel("Transverse Position [mm]")
-        ax_pft.set_ylabel("Relative Time [fs]")
-        ax_pft.set_title(pft_title, fontweight='bold')
-        ax_pft.grid(True, linestyle=':', alpha=0.6)
+        ax_pft.set_xlabel("Transverse Position [mm]"); ax_pft.set_ylabel("Relative Time [fs]")
+        ax_pft.set_title(pft_title, fontweight='bold'); ax_pft.grid(True, linestyle=':', alpha=0.6)
         
         x_pad = x_range * 0.15 if x_range > 1e-9 else 0.1
         y_span = dt_fs.max() - dt_fs.min()
@@ -427,46 +389,36 @@ class Draw:
         ax_pft.set_xlim(x_prime.min() - x_pad, x_prime.max() + x_pad)
         ax_pft.set_ylim(dt_fs.min() - y_pad, dt_fs.max() + y_pad)
 
-        # --- PLOT 2: LONGITUDINAL CHIRP (Only if active) ---
-        if chirp_mode:
-            ax_chirp.scatter(wls, dt_fs, c='blue', alpha=0.2, s=5)
+        # --- PLOT 2: LONGITUDINAL CHIRP (De-Tilted) ---
+        if chirp_mode and fit_success:
+            # Subtract the linear geometric tilt we just found
+            dt_fs_detilted = dt_fs - (tilt_val * x_prime)
             
+            ax_chirp.scatter(wls, dt_fs_detilted, c='blue', alpha=0.2, s=5)
+            
+            # Binning
             n_bins = 12
             valid_centers, mean_dts = [], []
             if wls.max() > wls.min():
                 bins = np.linspace(wls.min(), wls.max(), n_bins + 1)
                 bin_centers = 0.5 * (bins[1:] + bins[:-1])
-                
                 for i in range(n_bins):
                     bin_mask = (wls >= bins[i]) & (wls <= bins[i+1])
                     if np.sum(bin_mask) >= 2: 
-                        mean_dts.append(np.mean(dt_fs[bin_mask]))
+                        mean_dts.append(np.mean(dt_fs_detilted[bin_mask]))
                         valid_centers.append(bin_centers[i])
-                
                 valid_centers, mean_dts = np.array(valid_centers), np.array(mean_dts)
 
                 if len(valid_centers) > 1:
                     ax_chirp.plot(valid_centers, mean_dts, 'ro', markersize=6, alpha=0.8)
-                    try:
-                        coeffs = np.polyfit(valid_centers, mean_dts, 1)
-                        fit_w = np.linspace(min(valid_centers), max(valid_centers), 50)
-                        fit_t = np.polyval(coeffs, fit_w)
-                        ax_chirp.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8)
-                    except: pass
+                    # Plot fit line using the coefficient (wl_chirp_val)
+                    fit_w = np.linspace(wls.min(), wls.max(), 50)
+                    fit_t = wl_chirp_val * (fit_w - np.mean(wls)) + np.mean(dt_fs_detilted)
+                    ax_chirp.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8, label=f"Chirp: {wl_chirp_val:.0f} fs/μm")
+                    ax_chirp.legend(fontsize=9)
 
-            ax_chirp.set_xlabel(r"Wavelength [μm]")
-            ax_chirp.set_ylabel("Relative Delay [fs]")
-            ax_chirp.set_title(chirp_title, fontweight='bold')
-            ax_chirp.grid(True, linestyle=':', alpha=0.6)
-
-            if len(wls) > 0 and len(dt_fs) > 0:
-                w_span = wls.max() - wls.min()
-                t_span = dt_fs.max() - dt_fs.min()
-                w_pad = w_span * 0.1 if w_span > 1e-9 else 0.1
-                t_pad = t_span * 0.1 if t_span > 1e-9 else 10.0
-                
-                ax_chirp.set_xlim(wls.min() - w_pad, wls.max() + w_pad)
-                ax_chirp.set_ylim(dt_fs.min() - t_pad, dt_fs.max() + t_pad)
+            ax_chirp.set_xlabel(r"Wavelength [μm]"); ax_chirp.set_ylabel("De-Tilted Delay [fs]")
+            ax_chirp.set_title(chirp_title, fontweight='bold'); ax_chirp.grid(True, linestyle=':', alpha=0.6)
     
     @staticmethod
     def _draw_metrics_overlay(ax, snap, tracer, source_filter):
@@ -561,7 +513,7 @@ class Draw:
     @staticmethod
     def draw_system(manager, ax=None, tracer=None, draw_labels=True, show_skeleton=True, show_curvature=True, show_focus=True, auto_dimension=True, draw_beam_arrow=False, show_intersection_points=False, source_id_filter=None, show_plot=True, dimension_overrides=None, label_overrides=None):
         if ax is None: 
-            fig, ax = plt.subplots(figsize=(10, 8), dpi=120) # Removed layout='constrained' here too
+            fig, ax = plt.subplots(figsize=(10, 8), dpi=120) 
         if dimension_overrides is None: dimension_overrides = {}
         if label_overrides is None: label_overrides = {}
         ax.grid(False) 
@@ -605,11 +557,9 @@ class Draw:
     @staticmethod
     def add_colorbar(ax, mappable, label="Wavelength [um]"):
         if mappable and ax.figure:
-            # Check if a colorbar already exists to prevent duplicate drawing
             if not any(a.get_label() == '<colorbar>' for a in ax.figure.axes):
-                # FIX: Removed 'shrink', added 'fraction' and 'aspect' to make it perfectly fill the Y-height
                 cb = ax.figure.colorbar(mappable, ax=ax, label=label, fraction=0.025, pad=0.02, aspect=35)
-                cb.ax.set_label('<colorbar>') # Tag it so it doesn't duplicate on UI updates
+                cb.ax.set_label('<colorbar>')
 
     @staticmethod
     def finalize(ax, title="SPR Compressor", show=True):
