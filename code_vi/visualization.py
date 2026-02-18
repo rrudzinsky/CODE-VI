@@ -30,11 +30,13 @@ class Draw:
         n_time_steps = len(tracer.snapshots)
         
         include_beam = kwargs.get('draw_beam_arrow', False)
+        # Calculate global bounds once so the view is stable
         global_xlim, global_ylim = Draw._get_global_bounds(manager, tracer, include_beam=include_beam)
 
         plt.ioff()
         fig = plt.figure(figsize=(9, 9)) 
 
+        # Layout: Global on top, Chirp/PFT side-by-side on bottom
         gs = fig.add_gridspec(2, 2, height_ratios=[2, 1], width_ratios=[1, 1], 
                               left=0.12, right=0.90, top=0.95, bottom=0.10, hspace=0.3, wspace=0.35)
         
@@ -46,10 +48,22 @@ class Draw:
         fig.canvas.footer_visible = False
         plt.ion()
 
+        # Define Sliders & Controls FIRST
+        s_source = widgets.IntSlider(min=-1, max=n_sources-1, step=1, value=-1, description='Source ID:', layout=widgets.Layout(width='100%'))
+        s_time = widgets.IntSlider(min=-1, max=n_time_steps-1, step=1, value=-1, description='Time Step:', layout=widgets.Layout(width='100%'))
+        c_cloud = widgets.Checkbox(value=False, description='Show Interpolated Cloud')
+
+        # State to track view zooming
         current_view = {'xlim': global_xlim, 'ylim': global_ylim}
         first_draw = [True]
 
-        def update_dashboard(source_idx, time_idx, show_cloud):
+        def update_dashboard(change=None):
+            # Read values directly from the widgets
+            source_idx = s_source.value
+            time_idx = s_time.value
+            show_cloud = c_cloud.value
+
+            # Preserve zoom level unless it's the very first render
             if not first_draw[0]:
                 current_view['xlim'] = ax_global.get_xlim()
                 current_view['ylim'] = ax_global.get_ylim()
@@ -60,34 +74,50 @@ class Draw:
             
             filter_val = None if source_idx == -1 else source_idx
             
+            # --- LOGIC: Integrated (-1) vs Specific Time ---
             if time_idx == -1:
+                # INTEGRATED VIEW: Show full ray paths + Analysis of the FINAL snapshot
+                display_mode = "Integrated"
+                snap_to_analyze = tracer.snapshots[-1] if len(tracer.snapshots) > 0 else None
+                
+                # Draw full rays
                 Draw.draw_system(manager, tracer=tracer, ax=ax_global, source_id_filter=filter_val, show_plot=False, **kwargs)
-                ax_global.set_title(f"Integrated Path (Source #{filter_val if filter_val is not None else 'All'})", fontsize=14, fontweight='bold')
+                title_src = f"Source #{filter_val}" if filter_val is not None else "All Sources"
+                ax_global.set_title(f"Integrated Path ({title_src})", fontsize=14, fontweight='bold')
                 
-                if filter_val is not None:
-                    Draw._plot_pft_history(ax_pft, tracer, filter_val)
-                    ax_chirp.text(0.5, 0.5, "Select Time Step for Chirp", ha='center', va='center')
-                else:
-                    ax_pft.text(0.5, 0.5, "Select Time Step for Spatial Front", ha='center', va='center')
-                    ax_chirp.text(0.5, 0.5, "Select Time Step for Chirp", ha='center', va='center')
             else:
-                snap = tracer.snapshots[time_idx]
-                t_current = snap['t']
+                # SNAPSHOT VIEW: Show specific cloud + Analysis of THAT snapshot
+                display_mode = "Snapshot"
+                snap_to_analyze = tracer.snapshots[time_idx]
+                t_current = snap_to_analyze['t']
                 
+                # Draw system geometry only (no rays)
                 Draw.draw_system(manager, ax=ax_global, tracer=None, show_plot=False, **kwargs) 
                 
+                # Draw cloud
                 if show_cloud:
-                    Draw._draw_continuous_cloud(ax_global, snap, tracer, filter_val)
+                    Draw._draw_continuous_cloud(ax_global, snap_to_analyze, tracer, filter_val)
                 else:
-                    Draw._draw_photon_cloud_global(ax_global, snap, tracer, filter_val)
+                    Draw._draw_photon_cloud_global(ax_global, snap_to_analyze, tracer, filter_val)
                     
                 ax_global.set_title(f"Snapshot @ t={t_current:.1f} ps", fontsize=14, fontweight='bold')
-                Draw._analyze_pulse_shape(ax_chirp, ax_pft, snap, tracer, filter_val)
 
-            # --- FIX: Overlay metrics directly onto the global axis ---
-            snap_for_table = tracer.snapshots[time_idx] if time_idx != -1 else None
-            Draw._draw_metrics_overlay(ax_global, snap_for_table, tracer, filter_val)
+            # --- DIAGNOSTICS: Always Plot (using either current or final snap) ---
+            if snap_to_analyze:
+                Draw._analyze_pulse_shape(ax_chirp, ax_pft, snap_to_analyze, tracer, filter_val)
+                
+                # Add "(Final)" tag to titles if in Integrated mode
+                if display_mode == "Integrated":
+                    ax_pft.set_title(ax_pft.get_title() + " (Final)")
+                    ax_chirp.set_title(ax_chirp.get_title() + " (Final)")
+            else:
+                ax_pft.text(0.5, 0.5, "No Data", ha='center')
+                ax_chirp.text(0.5, 0.5, "No Data", ha='center')
 
+            # --- METRICS: Overlay text on global plot ---
+            Draw._draw_metrics_overlay(ax_global, snap_to_analyze, tracer, filter_val)
+
+            # Restore View
             ax_global.set_aspect('equal', adjustable='datalim') 
             ax_global.autoscale(False)
             ax_global.set_xlim(current_view['xlim'])
@@ -99,17 +129,21 @@ class Draw:
             first_draw[0] = False
             fig.canvas.draw_idle()
 
-        s_source = widgets.IntSlider(min=-1, max=n_sources-1, step=1, value=-1, description='Source ID:', layout=widgets.Layout(width='100%'))
-        s_time = widgets.IntSlider(min=-1, max=n_time_steps-1, step=1, value=-1, description='Time Step:', layout=widgets.Layout(width='100%'))
-        c_cloud = widgets.Checkbox(value=False, description='Show Interpolated Cloud')
+        # Connect Observers (The robust way to handle updates)
+        s_source.observe(update_dashboard, names='value')
+        s_time.observe(update_dashboard, names='value')
+        c_cloud.observe(update_dashboard, names='value')
         
-        ui = widgets.interactive(update_dashboard, source_idx=s_source, time_idx=s_time, show_cloud=c_cloud)
-        
+        # Display the UI
         display(widgets.VBox([
             widgets.HBox([s_source, s_time], layout=widgets.Layout(width='100%')),
             c_cloud,
             fig.canvas
         ]))
+        
+        # --- FIX: MANUALLY TRIGGER THE FIRST UPDATE ---
+        # This guarantees the plot is drawn immediately after display
+        update_dashboard()
 
     # ------------------------------------------------------------------
     #   STRUCTURED CLOUD RENDERING
