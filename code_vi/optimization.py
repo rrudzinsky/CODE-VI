@@ -1,13 +1,14 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from .ray_trace import RayTracer  # <--- Updated to relative import
+from .ray_trace import RayTracer
 
-def optimize_lens1_collimation(manager, lens1_name="Lens 1", guess_y=250.0, search_window=5.0, steps=30, show_plot=True):
+def optimize_lens_collimation(manager, lens_name="Lens 1", guess_y=250.0, search_window=5.0, steps=30, show_plot=True):
     """
-    Finds the exact y_center for Lens 1 that minimizes angular divergence (perfect collimation).
+    Finds the exact y_center for any lens that minimizes angular divergence (perfect collimation).
+    Useful for the first lens in a relay.
     """
-    print(f"--- Optimizing {lens1_name} for Collimation ---")
-    lens1 = next(el for el in manager.elements if el.name == lens1_name)
+    print(f"--- Optimizing {lens_name} for Collimation ---")
+    lens = next(el for el in manager.elements if el.name == lens_name)
     
     test_ys = np.linspace(guess_y - search_window, guess_y + search_window, steps)
     divergences = []
@@ -16,11 +17,11 @@ def optimize_lens1_collimation(manager, lens1_name="Lens 1", guess_y=250.0, sear
     min_div = np.inf
     
     for y in test_ys:
-        lens1.y_center = y
+        lens.y_center = y
         
         tracer = RayTracer(manager)
         tracer.generate_smart_spr_source(
-            n_sources=1, rays_per_source=30, target_optic_name=lens1_name, 
+            n_sources=1, rays_per_source=30, target_optic_name=lens_name, 
             grating_search_bounds=(12.0, 13.0), acceptance_angle_range=(70, 110), 
             grating_period=10.0, beam_energy=0.99
         )
@@ -45,17 +46,78 @@ def optimize_lens1_collimation(manager, lens1_name="Lens 1", guess_y=250.0, sear
         plt.figure(figsize=(6,3))
         plt.plot(test_ys, divergences, 'b.-')
         plt.axvline(best_y, color='r', linestyle='--', label='Optimal Position')
-        plt.title(f"{lens1_name} Collimation Optimization")
-        plt.xlabel("Lens 1 y_center (mm)")
+        plt.title(f"{lens_name} Collimation Optimization")
+        plt.xlabel(f"{lens_name} y_center (mm)")
         plt.ylabel("Beam Divergence (rad)")
         plt.grid(True); plt.legend(); plt.show()
     
-    lens1.y_center = best_y
+    lens.y_center = best_y
+    return best_y
+
+def optimize_telecentric_spacing(manager, lens_name="Lens 2", guess_y=750.0, search_window=10.0, steps=20, show_plot=True):
+    """
+    Finds the exact y_center for the second lens in a relay that achieves perfect 4f telecentricity.
+    Minimizes the angular deviation (vx) of off-axis beamlets.
+    """
+    print(f"--- Optimizing {lens_name} for Telecentric Spacing ---")
+    lens = next(el for el in manager.elements if el.name == lens_name)
+    
+    test_ys = np.linspace(guess_y - search_window, guess_y + search_window, steps)
+    telecentric_errors = []
+    
+    best_y = guess_y
+    min_error = np.inf
+    
+    for y in test_ys:
+        lens.y_center = y
+        
+        tracer = RayTracer(manager)
+        tracer.generate_smart_spr_source(
+            n_sources=3, rays_per_source=20, target_optic_name=lens_name, 
+            grating_search_bounds=(0.0, 25.4), acceptance_angle_range=(70, 110), 
+            grating_period=10.0, beam_energy=0.99
+        )
+        
+        for t in np.arange(0, 3500, 50.0): tracer.run_time_step(t, 50.0)
+        
+        snap = tracer.snapshots[-1]
+        if len(snap['ids']) > 5:
+            source_ids = tracer._source_id[snap['ids']]
+            unique_sources = np.unique(source_ids)
+            
+            mean_vxs = []
+            for src in unique_sources:
+                mask = (source_ids == src)
+                vx_src = snap['vx'][mask]
+                mean_vxs.append(np.mean(vx_src))
+                
+            error = np.std(mean_vxs) + np.abs(np.mean(mean_vxs))
+            telecentric_errors.append(error)
+            
+            if error < min_error:
+                min_error = error
+                best_y = y
+        else:
+            telecentric_errors.append(np.nan)
+            
+    print(f"✅ Best Telecentric Position: y = {best_y:.3f} mm (Error: {min_error:.6f})")
+    
+    if show_plot:
+        plt.figure(figsize=(6,3))
+        plt.plot(test_ys, telecentric_errors, 'm.-')
+        plt.axvline(best_y, color='r', linestyle='--', label='Optimal Position')
+        plt.title(f"{lens_name} Telecentric Spacing Optimization")
+        plt.xlabel(f"{lens_name} y_center (mm)")
+        plt.ylabel("Telecentric Error (vx deviation)")
+        plt.grid(True); plt.legend(); plt.show()
+    
+    lens.y_center = best_y
     return best_y
 
 def optimize_focal_plane(manager, guess_y=1000.0, search_window=10.0, steps=40, show_plot=True):
     """
     Finds the exact y-coordinate where the spatial spread (spot size) is minimized.
+    Does not move any physical lenses; it just maps the beam waist.
     """
     print("--- Hunting for Exact Image Plane (Focus) ---")
     
@@ -99,7 +161,7 @@ def optimize_focal_plane(manager, guess_y=1000.0, search_window=10.0, steps=40, 
         plt.figure(figsize=(6,3))
         plt.plot(test_planes, spot_sizes, 'g.-')
         plt.axvline(best_plane, color='r', linestyle='--', label='Optimal Focus')
-        plt.title("Focal Plane Optimization")
+        plt.title("Focal Plane Location Mapping")
         plt.xlabel("Y Position (mm)")
         plt.ylabel("RMS Spot Size (mm)")
         plt.grid(True); plt.legend(); plt.show()
