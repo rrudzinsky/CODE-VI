@@ -2,17 +2,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 import io
 from contextlib import redirect_stdout
+from scipy.optimize import minimize_scalar
 from .ray_trace import RayTracer
 
 def _plot_results(x_data, y_data, best_x, title, xlabel, ylabel):
-    """Helper to generate clean, toolbar-free plots."""
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.plot(x_data, y_data, '.-', color='C0')
-    ax.axvline(best_x, color='r', linestyle='--', label='Optimal Position')
-    ax.set_title(title); ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
-    ax.grid(True); ax.legend(); fig.tight_layout()
-    if hasattr(fig.canvas, 'toolbar_visible'):
-        fig.canvas.toolbar_visible = fig.canvas.header_visible = fig.canvas.footer_visible = False
+    """Absolute basic plotting function."""
+    plt.figure(figsize=(6, 3))
+    plt.plot(x_data, y_data, '.-', color='C0')
+    plt.axvline(best_x, color='r', linestyle='--', label=f'Exact Opt: {best_x:.3f}')
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
     plt.show()
 
 def optimize_lens_collimation(manager, lens_name="Lens 1", guess_y=None, search_window=15.0, steps=30, show_plot=True):
@@ -20,14 +23,9 @@ def optimize_lens_collimation(manager, lens_name="Lens 1", guess_y=None, search_
     lens = next(el for el in manager.elements if el.name == lens_name)
     guess_y = lens.y_center if guess_y is None else guess_y
         
-    test_ys = np.linspace(guess_y - search_window, guess_y + search_window, steps)
-    divergences = []
-    best_y, min_div = guess_y, np.inf
-    
-    for y in test_ys:
+    def objective(y):
         lens.y_center = y
         manager._calculate_surface_geometry(lens) 
-        
         tracer = RayTracer(manager)
         with redirect_stdout(io.StringIO()):
             tracer.generate_smart_spr_source(
@@ -35,19 +33,27 @@ def optimize_lens_collimation(manager, lens_name="Lens 1", guess_y=None, search_
                 grating_search_bounds=(12.0, 13.0), acceptance_angle_range=(70, 110), 
                 grating_period=10.0, beam_energy=0.99
             )
-        
         for t in np.arange(0, 1500, 50.0): tracer.run_time_step(t, 50.0)
-        
         snap = tracer.snapshots[-1]
+        
         if len(snap['ids']) > 5:
-            div = np.std(np.arctan2(snap['vy'], snap['vx']))
-            divergences.append(div)
-            if div < min_div: best_y, min_div = y, div
-        else:
-            divergences.append(np.nan)
+            return np.std(np.arctan2(snap['vy'], snap['vx']))
+        return 1e6
+
+    test_ys = np.linspace(guess_y - search_window, guess_y + search_window, steps)
+    grid_divs = [objective(y) for y in test_ys]
+    
+    best_discrete_idx = np.argmin(grid_divs)
+    step_size = test_ys[1] - test_ys[0]
+    bounds = (test_ys[best_discrete_idx] - step_size, test_ys[best_discrete_idx] + step_size)
+    
+    res = minimize_scalar(objective, bounds=bounds, method='bounded', options={'xatol': 1e-4})
+    best_y = res.x
+    min_div = res.fun
             
-    print(f"✅ Best Collimation Position: y = {best_y:.3f} mm (Divergence: {min_div:.6f} rad)")
-    if show_plot: _plot_results(test_ys, divergences, best_y, f"{lens_name} Collimation", f"{lens_name} y_center (mm)", "Beam Divergence (rad)")
+    print(f"✅ Exact Collimation Position: y = {best_y:.4f} mm (Divergence: {min_div:.6f} rad)")
+    if show_plot: 
+        _plot_results(test_ys, grid_divs, best_y, f"{lens_name} Collimation", f"{lens_name} y_center (mm)", "Beam Divergence (rad)")
     
     lens.y_center = best_y
     manager._calculate_surface_geometry(lens) 
@@ -58,14 +64,9 @@ def optimize_telecentric_spacing(manager, lens_name="Lens 2", guess_y=None, sear
     lens = next(el for el in manager.elements if el.name == lens_name)
     guess_y = lens.y_center if guess_y is None else guess_y
         
-    test_ys = np.linspace(guess_y - search_window, guess_y + search_window, steps)
-    errors = []
-    best_y, min_error = guess_y, np.inf
-    
-    for y in test_ys:
+    def objective(y):
         lens.y_center = y
         manager._calculate_surface_geometry(lens)
-        
         tracer = RayTracer(manager)
         with redirect_stdout(io.StringIO()):
             tracer.generate_smart_spr_source(
@@ -73,22 +74,29 @@ def optimize_telecentric_spacing(manager, lens_name="Lens 2", guess_y=None, sear
                 grating_search_bounds=(0.0, 25.4), acceptance_angle_range=(70, 110), 
                 grating_period=10.0, beam_energy=0.99
             )
-        
         for t in np.arange(0, 3500, 50.0): tracer.run_time_step(t, 50.0)
-        
         snap = tracer.snapshots[-1]
+        
         if len(snap['ids']) > 5:
             src_ids = tracer._source_id[snap['ids']]
             mean_vxs = [np.mean(snap['vx'][src_ids == src]) for src in np.unique(src_ids)]
-            error = np.std(mean_vxs) + np.abs(np.mean(mean_vxs))
-            errors.append(error)
+            return np.std(mean_vxs) + np.abs(np.mean(mean_vxs))
+        return 1e6
+
+    test_ys = np.linspace(guess_y - search_window, guess_y + search_window, steps)
+    grid_errors = [objective(y) for y in test_ys]
+    
+    best_discrete_idx = np.argmin(grid_errors)
+    step_size = test_ys[1] - test_ys[0]
+    bounds = (test_ys[best_discrete_idx] - step_size, test_ys[best_discrete_idx] + step_size)
+    
+    res = minimize_scalar(objective, bounds=bounds, method='bounded', options={'xatol': 1e-4})
+    best_y = res.x
+    min_error = res.fun
             
-            if error < min_error: best_y, min_error = y, error
-        else:
-            errors.append(np.nan)
-            
-    print(f"✅ Best Telecentric Position: y = {best_y:.3f} mm (Error: {min_error:.6f})")
-    if show_plot: _plot_results(test_ys, errors, best_y, f"{lens_name} Telecentric Spacing", f"{lens_name} y_center (mm)", "Telecentric Error")
+    print(f"✅ Exact Telecentric Position: y = {best_y:.4f} mm (Error: {min_error:.6f})")
+    if show_plot: 
+        _plot_results(test_ys, grid_errors, best_y, f"{lens_name} Telecentric Spacing", f"{lens_name} y_center (mm)", "Telecentric Error")
     
     lens.y_center = best_y
     manager._calculate_surface_geometry(lens) 
@@ -114,20 +122,98 @@ def optimize_focal_plane(manager, guess_y=None, search_window=15.0, steps=40, sh
     if len(snap['ids']) < 5: return guess_y
         
     x0, y0, vx, vy = snap['x'], snap['y'], snap['vx'], snap['vy']
-    test_planes = np.linspace(guess_y - search_window, guess_y + search_window, steps)
-    spot_sizes = []
-    best_plane, min_spot = guess_y, np.inf
     
-    for plane_y in test_planes:
+    def objective(plane_y):
         projected_x = x0 + vx * ((plane_y - y0) / vy)
-        spot_size = np.std(projected_x)
-        spot_sizes.append(spot_size)
-        if spot_size < min_spot: best_plane, min_spot = plane_y, spot_size
+        return np.std(projected_x)
 
-    print(f"✅ Best Focal Plane: y = {best_plane:.3f} mm (RMS Spot Size: {min_spot:.4f} mm)")
-    if show_plot: _plot_results(test_planes, spot_sizes, best_plane, "Focal Plane Location Mapping", "Y Position (mm)", "RMS Spot Size (mm)")
+    test_planes = np.linspace(guess_y - search_window, guess_y + search_window, steps)
+    spot_sizes = [objective(y) for y in test_planes]
+    
+    best_discrete_idx = np.argmin(spot_sizes)
+    step_size = test_planes[1] - test_planes[0]
+    bounds = (test_planes[best_discrete_idx] - step_size, test_planes[best_discrete_idx] + step_size)
+    
+    res = minimize_scalar(objective, bounds=bounds, method='bounded', options={'xatol': 1e-4})
+    best_plane = res.x
+    min_spot = res.fun
+
+    print(f"✅ Exact Focal Plane: y = {best_plane:.4f} mm (RMS Spot Size: {min_spot:.4f} mm)")
+    if show_plot: 
+        _plot_results(test_planes, spot_sizes, best_plane, "Focal Plane Location Mapping", "Y Position (mm)", "RMS Spot Size (mm)")
     
     return best_plane
+
+def plot_field_curvature(manager, lens2_name="Lens 2", search_window=50.0, steps=200):
+    print("--- Mapping Focal Surface (Field Curvature) ---")
+    
+    l2 = next(el for el in manager.elements if el.name == lens2_name)
+    approx_focus_y = l2.y_center + 250.0 
+    
+    tracer = RayTracer(manager)
+    with redirect_stdout(io.StringIO()):
+        tracer.generate_smart_spr_source(
+            n_sources=5, rays_per_source=30, target_optic_name=lens2_name, 
+            grating_search_bounds=(0, 25.4), acceptance_angle_range=(70, 110), 
+            grating_period=10.0, beam_energy=0.99
+        )
+    
+    for t in np.arange(0, 4500, 50.0): 
+        tracer.run_time_step(t, 50.0)
+        
+    snap = tracer.snapshots[-1]
+    
+    x0, y0 = snap['x'], snap['y']
+    vx, vy = snap['vx'], snap['vy']
+    src_ids = tracer._source_id[snap['ids']]
+    
+    focal_points_x = []
+    focal_points_y = []
+    
+    test_planes = np.linspace(approx_focus_y - search_window, approx_focus_y + search_window, steps)
+    unique_sources = np.unique(src_ids)
+    
+    for src in unique_sources:
+        mask = (src_ids == src)
+        src_x0, src_y0 = x0[mask], y0[mask]
+        src_vx, src_vy = vx[mask], vy[mask]
+        
+        min_spot = np.inf
+        best_y = approx_focus_y
+        best_x = 0.0
+        
+        for plane_y in test_planes:
+            projected_x = src_x0 + src_vx * ((plane_y - src_y0) / src_vy)
+            spot_size = np.std(projected_x)
+            
+            if spot_size < min_spot:
+                min_spot = spot_size
+                best_y = plane_y
+                best_x = np.mean(projected_x)
+                
+        focal_points_x.append(best_x)
+        focal_points_y.append(best_y)
+        print(f"Source {src}: Focus at X={best_x:.2f}, Y={best_y:.2f} (Spot RMS={min_spot:.4f})")
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(focal_points_x, focal_points_y, 'o-', color='crimson', markersize=8, linewidth=2, label='Focal Surface')
+    
+    if len(focal_points_x) > 2:
+        z = np.polyfit(focal_points_x, focal_points_y, 2)
+        p = np.poly1d(z)
+        x_smooth = np.linspace(min(focal_points_x), max(focal_points_x), 100)
+        plt.plot(x_smooth, p(x_smooth), 'r--', alpha=0.5, label='Petzval Arc Fit')
+
+    plt.axhline(np.mean(focal_points_y), color='k', linestyle='--', alpha=0.3, label='Average Focal Plane')
+    plt.title("Field Curvature: Focus Location per Source")
+    plt.xlabel("Transverse Position X (mm)")
+    plt.ylabel("Longitudinal Focal Position Y (mm)")
+    plt.grid(True)
+    plt.legend()
+    plt.gca().invert_yaxis() 
+    plt.show()
+    
+    return focal_points_x, focal_points_y
 
 def optimize_compressor_gratings(manager, g2_name="Grating 2", focal_plane_base=1000.0, angle_steps=5, offset_steps=5):
     print("--- Hunting for Higher-Order Dispersion Null Point ---")
