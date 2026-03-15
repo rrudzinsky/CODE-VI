@@ -31,7 +31,7 @@ class MaterialLib:
     def get_index(material_name, wavelength_um):
         """
         Returns Refractive Index (n) at a specific wavelength [microns].
-        Required for Ray Tracing.
+        Fully vectorized to accept numpy arrays of wavelengths.
         """
         if not material_name: return 1.0
         mat = material_name.lower()
@@ -56,8 +56,11 @@ class MaterialLib:
         """
         ZnSe Refractive Index Formula (Sellmeier-like).
         Source: User provided constants.
-        Input: Wavelength in MICRONS (um).
+        Input: Wavelength in MICRONS (um). Accepts scalar or numpy array.
         """
+        # Ensure input acts as an array for safe vector math
+        lam = np.asarray(lam)
+        
         # Constants
         first_term = 1 - 0.689818 
         
@@ -69,6 +72,7 @@ class MaterialLib:
         
         n_squared = first_term + second_term + third_term + fourth_term
         
-        # Safety check for sqrt to avoid domain errors
-        if n_squared < 0: return 1.0
-        return np.sqrt(n_squared)
+        # Vectorized safety check: replaces any value < 0 with 1.0
+        n_squared_safe = np.where(n_squared < 0, 1.0, n_squared)
+        
+        return np.sqrt(n_squared_safe)

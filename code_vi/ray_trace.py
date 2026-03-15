@@ -3,8 +3,9 @@ import pandas as pd
 from .materials import MaterialLib
 
 class RayTracer:
-    def __init__(self, manager):
+    def __init__(self, manager, mode="geometric"):
         self.manager = manager
+        self.mode = mode  # "geometric" or "wave"
         self.c_mm_ps = 0.299792458
         self._reset_arrays()
 
@@ -23,6 +24,11 @@ class RayTracer:
         self._current_surf_in_optic = np.array([], dtype=int)
         self._current_n = np.array([])
         
+        # --- WAVE OPTICS ARRAYS ---
+        if self.mode == "wave":
+            self._opl = np.array([])
+            self._phase = np.array([])
+            
         self.rays = pd.DataFrame()
         self.history = {}
         self.snapshots = []
@@ -34,7 +40,7 @@ class RayTracer:
     def generate_smart_spr_source(self, n_sources=5, rays_per_source=20, 
                                   target_optic_name="Lens 2", 
                                   grating_search_bounds=(0.0, 100.0),
-                                  acceptance_angle_range=(70.0, 110.0), # Updated default to point UP at lenses
+                                  acceptance_angle_range=(70.0, 110.0),
                                   grating_period=10.0,
                                   beam_energy=0.99):
         """
@@ -58,7 +64,6 @@ class RayTracer:
         # 2. Find Spatial Extent (Coarse Scan)
         print("   Step 1: Finding valid grating length...")
         
-        # --- FIX 1: Pass grating_period and beam_energy to get accurate wavelengths ---
         valid_x_min, valid_x_max = self._find_spatial_bounds(
             target_idx, grating_search_bounds, acceptance_angle_range,
             grating_period, beam_energy
@@ -74,7 +79,6 @@ class RayTracer:
         # 3. Calculate Source Positions
         source_positions = np.linspace(valid_x_min, valid_x_max, n_sources)
         
-        # Store optimization results temporarily
         optimized_sources = []
 
         print(f"   Step 2: Optimizing angles for {n_sources} sources...")
@@ -82,8 +86,6 @@ class RayTracer:
         
         # 4. Angular Optimization Loop
         for i, sx in enumerate(source_positions):
-            # A. Find EXACT angular limits for this specific spot
-            # --- FIX 2: Pass grating_period and beam_energy here as well ---
             theta_min, theta_max = self._find_angular_limits_bisection(
                 sx, source_y, target_idx, acceptance_angle_range,
                 grating_period, beam_energy
@@ -96,7 +98,7 @@ class RayTracer:
             })
 
         # 5. Clear Arrays and Generate REAL Rays
-        self._reset_arrays() # Clear the probe data
+        self._reset_arrays()
         
         start_idx = 0
         electron_speed = self.c_mm_ps * beam_energy
@@ -108,7 +110,6 @@ class RayTracer:
             
             ang_span = theta_max - theta_min
             
-            # Smart Ray Count: If span is tiny, just shoot 1 ray to avoid waste
             if ang_span < 1e-6:
                 angles = np.array([(theta_min + theta_max)/2])
                 n_rays_here = 1
@@ -122,7 +123,6 @@ class RayTracer:
             t_delay = sx / electron_speed
             rads = np.deg2rad(angles)
             
-            # SPR Relation: lambda = d * (1/beta - cos(theta))
             wls = grating_period * (1.0/beam_energy - np.cos(rads))
             
             # Append Data
@@ -140,6 +140,13 @@ class RayTracer:
             self._current_surf_in_optic = np.concatenate([self._current_surf_in_optic, np.zeros(n_rays_here, dtype=int)])
             self._current_n = np.concatenate([self._current_n, np.ones(n_rays_here)])
 
+            # --- WAVE OPTICS INIT ---
+            if self.mode == "wave":
+                self._opl = np.concatenate([self._opl, np.zeros(n_rays_here)])
+                # Initial phase is set by the electron arrival time (t_delay * frequency)
+                # But for relative pulse compression, setting to 0.0 is often sufficient as a baseline.
+                self._phase = np.concatenate([self._phase, np.zeros(n_rays_here)])
+
             for r in range(n_rays_here):
                 self.history[start_idx + r] = [(sx, source_y)]
             
@@ -147,12 +154,12 @@ class RayTracer:
 
         print(f"   Done. Generated {len(self._x)} optimized rays.")
         self._sync_to_dataframe()
+
     # ------------------------------------------------------------------
     #   OPTIMIZATION HELPERS (Bisection Logic)
     # ------------------------------------------------------------------
 
     def _find_spatial_bounds(self, target_idx, search_bounds, ang_range, grating_period, beam_energy):
-        """Scans X-axis to find the first and last point that can hit target."""
         probes = np.linspace(search_bounds[0], search_bounds[1], 20)
         valid_indices = []
         
@@ -164,7 +171,6 @@ class RayTracer:
         return min(valid_indices), max(valid_indices)
 
     def _find_angular_limits_bisection(self, x, y, target_idx, ang_range, grating_period, beam_energy):
-        """Finds the precise Cut-On and Cut-Off angles for a given point."""
         seeds = np.linspace(ang_range[0], ang_range[1], 40) 
         results = [self._fast_trace_check(x, y, ang, target_idx, grating_period, beam_energy) for ang in seeds]
         
@@ -175,7 +181,6 @@ class RayTracer:
         first_valid_idx = results.index(True)
         last_valid_idx = len(results) - 1 - results[::-1].index(True)
         
-        # Refine Lower Bound (Cut-On)
         if first_valid_idx == 0:
             theta_min = seeds[0] 
         else:
@@ -189,7 +194,6 @@ class RayTracer:
                     low = mid 
             theta_min = high
 
-        # Refine Upper Bound (Cut-Off)
         if last_valid_idx == len(seeds) - 1:
             theta_max = seeds[-1] 
         else:
@@ -213,13 +217,7 @@ class RayTracer:
         return False
 
     def _fast_trace_check(self, x, y, angle_deg, target_idx, grating_period, beam_energy):
-        """
-        Runs a solitary ray trace with CORRECT wavelengths.
-        Enforces Clear Aperture on EVERY surface it hits.
-        """
         rads = np.deg2rad(angle_deg)
-        
-        # Calculate actual SPR wavelength for correct refractive index!
         wl_mm = grating_period * (1.0/beam_energy - np.cos(rads))
         
         self._x = np.array([x])
@@ -234,71 +232,62 @@ class RayTracer:
         self._current_optic_idx = np.zeros(1, dtype=int)
         self._current_surf_in_optic = np.zeros(1, dtype=int)
         self._current_n = np.ones(1)
-        self.history = {0: [(x, y)]} # Start history tracker
+
+        if self.mode == "wave":
+            self._opl = np.zeros(1)
+            self._phase = np.zeros(1)
+
+        self.history = {0: [(x, y)]} 
         
         max_dist = 4000.0 
-        dt = 50.0 # Fast step, history catches everything
-        
-        # --- THE FIX: We must advance a fake clock for the new time-stepper ---
+        dt = 50.0 
         sim_time = 0.0
         
-        # 1. Run the trace until it passes the target or leaves the system
         for _ in range(int(max_dist/dt)):
             self.run_time_step(sim_time, dt) 
-            sim_time += dt # <--- Clock moves forward!
+            sim_time += dt 
             
             if self._current_optic_idx[0] > target_idx:
                 break
             if self._current_optic_idx[0] >= len(self.manager.elements):
                 break
                 
-        # 2. Did it physically reach the end?
         if self._current_optic_idx[0] <= target_idx:
             return False
 
-        # Universal Clear Aperture Enforcement
         points = self.history[0]
-        point_idx = 1 # Skip the start position
+        point_idx = 1 
         
         for opt_idx in range(target_idx + 1):
             el = self.manager.elements[opt_idx]
             ap_radius = el.clear_aperture / 2.0
             
-            # Setup transformation to optical axis
             ang_rad = np.deg2rad(el.orientation_angle)
             tx, ty = -np.sin(ang_rad), np.cos(ang_rad)
             
-            # Check every surface of this optic
             num_surfs = len(el.surface_names)
             for _ in range(num_surfs):
                 if point_idx < len(points):
                     px, py = points[point_idx]
                     
-                    # Calculate radial distance perpendicular to optical axis
                     dx = px - el.x_center
                     dy = py - el.y_center
                     radial_dist = abs(dx * tx + dy * ty)
                     
                     if radial_dist > ap_radius:
-                        return False # Ray violated clear aperture of Optic #{opt_idx}!
+                        return False 
                     
                     point_idx += 1
                     
         return True
+
     # ------------------------------------------------------------------
-    #   CORE PHYSICS ENGINE (Standard)
+    #   CORE PHYSICS ENGINE (Standard + Wave Toggle)
     # ------------------------------------------------------------------
 
     def run_time_step(self, t_current, dt):
-        """
-        Advanced time stepper that handles sub-step ray activation.
-        Ensures correct Pulse-Front Tilt even with large dt.
-        """
         t_end_of_step = t_current + dt
 
-        # 1. Activate rays due within this step window
-        # We use < t_end_of_step to ensure a ray scheduled exactly at the boundary 
-        # is picked up in the *next* step, avoiding double counting.
         activation_condition = (self._t_total < t_end_of_step) & (~self._active)
         self._active[activation_condition] = True
         
@@ -307,35 +296,23 @@ class RayTracer:
         active_indices = np.where(self._active)[0]
         remaining_dt = np.zeros(len(self._x))
         
-        # 2. Calculate precise remaining time for this step.
-        # - Rays already running get the full 'dt'.
-        # - Rays just born mid-step only get the time remaining from their birth moment.
         start_times = self._t_total[active_indices]
-        # The effective start for this step is either the step start time OR the ray's birth time, whichever is later.
         effective_start_times = np.maximum(start_times, t_current)
         remaining_dt[active_indices] = t_end_of_step - effective_start_times
-        
-        # Ensure numerical stability (no tiny negative times)
         remaining_dt[active_indices] = np.maximum(0.0, remaining_dt[active_indices])
         
-        # 3. Geometric Propagation Loop (Iterative intersection check)
         iteration = 0
         while iteration < 20: 
-            # Only move rays that still have time left in this step
             moving_indices = np.where(remaining_dt > 1e-6)[0]
             if len(moving_indices) == 0: break
             
-            # Get current speeds in medium
             speeds = self.c_mm_ps / self._current_n[moving_indices]
-            
-            # Check for intersections along the path
             hits, dist_hits, normals, surface_names = self._check_intersections_with_skeleton(moving_indices)
             
-            # A hit is valid only if it occurs WITHIN the remaining time budget
             max_dist_for_step = remaining_dt[moving_indices] * speeds + 1e-7
             valid_hit_mask = hits & (dist_hits <= max_dist_for_step)
             
-            # --- Handle HITS (Move to surface, apply physics, update time) ---
+            # --- Handle HITS ---
             if np.any(valid_hit_mask):
                 local_hit_idx = np.where(valid_hit_mask)[0] 
                 global_hit_idx = moving_indices[local_hit_idx]
@@ -344,13 +321,17 @@ class RayTracer:
                 self._x[global_hit_idx] += self._vx[global_hit_idx] * h_dist
                 self._y[global_hit_idx] += self._vy[global_hit_idx] * h_dist
                 
-                # Calculate time consumed to reach surface
+                # WAVE OPTICS UPDATE: Accumulate OPL and Phase for hits
+                if self.mode == "wave":
+                    opl_step = h_dist * self._current_n[global_hit_idx]
+                    self._opl[global_hit_idx] += opl_step
+                    # phase = 2pi * OPL / lambda (converting lambda microns to mm)
+                    self._phase[global_hit_idx] += (2.0 * np.pi * opl_step) / (self._wavelength[global_hit_idx] / 1000.0)
+
                 t_used = h_dist / speeds[local_hit_idx]
-                # Update ray's absolute clock and subtract from step budget
                 self._t_total[global_hit_idx] += t_used
                 remaining_dt[global_hit_idx] -= t_used
                 
-                # Apply physics (refraction/reflection) at the surface
                 for i, g_idx in enumerate(global_hit_idx):
                     self.history[g_idx].append((self._x[g_idx], self._y[g_idx]))
                     
@@ -360,7 +341,7 @@ class RayTracer:
                     
                     self._apply_physics_numpy(g_idx, (nx, ny), s_name)
 
-            # --- Handle FLYING (Move full remaining distance, finish step) ---
+            # --- Handle FLYING ---
             fly_mask = ~valid_hit_mask
             if np.any(fly_mask):
                 local_fly_idx = np.where(fly_mask)[0]
@@ -369,31 +350,32 @@ class RayTracer:
                 dist = speeds[local_fly_idx] * remaining_dt[global_fly_idx]
                 self._x[global_fly_idx] += self._vx[global_fly_idx] * dist
                 self._y[global_fly_idx] += self._vy[global_fly_idx] * dist
+
+                # WAVE OPTICS UPDATE: Accumulate OPL and Phase for flyers
+                if self.mode == "wave":
+                    opl_step = dist * self._current_n[global_fly_idx]
+                    self._opl[global_fly_idx] += opl_step
+                    self._phase[global_fly_idx] += (2.0 * np.pi * opl_step) / (self._wavelength[global_fly_idx] / 1000.0)
                 
-                # Update total time and consume rest of budget
                 self._t_total[global_fly_idx] += remaining_dt[global_fly_idx]
                 remaining_dt[global_fly_idx] = 0 
             
             iteration += 1
 
-        # 4. Take Snapshot for Visualization
-        # Only record rays that have actually started moving (t_total > t_delay)
-        # We use a small epsilon to ensure freshly born rays are captured.
-        has_started = self._t_total > (self._wavelength * 0.0 + 1e-9) # Hack to get source-specific delay
-        # Better way: reconstruct delay from source ID? No, t_total is sufficient.
-        # A ray has started if its current t_total is > its initial delay.
-        # Since we overwrite t_total, this is hard to track.
-        # Simpler: Record anything active.
-        
         if np.any(self._active):
-            self.snapshots.append({
-                't': t_end_of_step, # Record at the END of the step
+            snapshot = {
+                't': t_end_of_step, 
                 'x': self._x[self._active].copy(), 
                 'y': self._y[self._active].copy(),
                 'vx': self._vx[self._active].copy(),
                 'vy': self._vy[self._active].copy(),
                 'ids': np.where(self._active)[0]
-            })
+            }
+            if self.mode == "wave":
+                snapshot['opl'] = self._opl[self._active].copy()
+                snapshot['phase'] = self._phase[self._active].copy()
+                
+            self.snapshots.append(snapshot)
 
     def _check_intersections_with_skeleton(self, active_indices):
         n_rays = len(active_indices)
@@ -503,30 +485,33 @@ class RayTracer:
         elif el.optic_type == "Grating":
             dot = vx*nx + vy*ny
             
-            # Ensure normal points AGAINST the incoming ray
             if dot > 0:
                 nx, ny = -nx, -ny
                 dot = -dot
                 
-            # Define tangent vector (parallel to grating surface)
             tx, ty = -ny, nx
-            
-            # Project velocity onto tangent (sin of incident angle)
             t_in = vx*tx + vy*ty
             
-            # Fetch Grating properties
             G = getattr(el, 'groove_density', 0.0)
             m = getattr(el, 'diffraction_order', 1)
-            
-            # --- CRITICAL FIX: Convert Wavelength from microns to mm! ---
             wl_mm = self._wavelength[idx] / 1000.0 
             
-            # Apply Diffraction Equation: sin(Out) = sin(In) + m * lambda * G
             t_out = t_in + (m * wl_mm * G)
+
+            # WAVE OPTICS UPDATE: Instantaneous Grating Phase Jump
+            if self.mode == "wave":
+                # Find lateral position along the grating surface
+                lx = self._x[idx] - el.x_center
+                ly = self._y[idx] - el.y_center
+                ang_rad = np.deg2rad(el.orientation_angle)
+                y_local = -lx * np.sin(ang_rad) + ly * np.cos(ang_rad)
+                
+                # Apply phase jump based on grating equation
+                phase_jump = 2.0 * np.pi * m * G * y_local
+                self._phase[idx] += phase_jump
             
-            # Check if the light is diffracted into an Evanescent wave
             if abs(t_out) > 1.0:
-                self._active[idx] = False # Ray is lost/absorbed
+                self._active[idx] = False 
             else:
                 n_out = np.sqrt(1.0 - t_out**2)
                 self._vx[idx] = t_out*tx + n_out*nx
@@ -535,7 +520,7 @@ class RayTracer:
             self._current_optic_idx[idx] += 1
             self._current_surf_in_optic[idx] = 0
             
-        # --- LENSES (Sequential) & PRISMS (Non-Sequential) ---
+        # --- LENSES & PRISMS ---
         elif el.optic_type in ["Lens", "Prism"]:
             n1 = self._current_n[idx]
             wl_microns = self._wavelength[idx]
@@ -555,7 +540,7 @@ class RayTracer:
             cos_i = -dot
             sin2_t2 = mu**2 * (1.0 - cos_i**2)
             
-            if sin2_t2 > 1.0: # TIR
+            if sin2_t2 > 1.0: 
                 self._vx[idx] = vx - 2 * dot * nx
                 self._vy[idx] = vy - 2 * dot * ny
             else:
@@ -564,7 +549,6 @@ class RayTracer:
                 self._vy[idx] = mu*vy + factor*ny
                 self._current_n[idx] = n2
             
-            # --- NEXT STATE LOGIC ---
             if el.optic_type == "Lens":
                 self._current_surf_in_optic[idx] += 1
                 if self._current_surf_in_optic[idx] >= len(el.surface_names):
@@ -582,8 +566,15 @@ class RayTracer:
             self._current_optic_idx[idx] = 999 
 
     def _sync_to_dataframe(self):
-        self.rays = pd.DataFrame({
+        data_dict = {
             'x': self._x, 'y': self._y, 'vx': self._vx, 'vy': self._vy,
             'source_id': self._source_id, 'active': self._active,
             'wavelength': self._wavelength, 't_total': self._t_total
-        })
+        }
+        
+        # Pass OPL and Phase to the final DataFrame for analysis
+        if self.mode == "wave":
+            data_dict['opl'] = self._opl
+            data_dict['phase'] = self._phase
+            
+        self.rays = pd.DataFrame(data_dict)

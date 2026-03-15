@@ -2,23 +2,22 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
-# import matplotlib.tri as mtri # REMOVED: No longer needed for smooth cloud
 from matplotlib.collections import LineCollection
+from scipy.interpolate import interp1d
 import numpy as np
 import pandas as pd
 import ipywidgets as widgets
 from IPython.display import display
 from scipy.stats import linregress
-from scipy.interpolate import griddata # <--- NEW IMPORT for smoother clouds
+from scipy.interpolate import griddata 
 from .materials import MaterialLib
 
 class Draw:
     """
     Static helper class for rendering the optical system using Matplotlib.
-    Features: Dual-Panel Interactive Dashboard, PFT Analysis, Fixed Axes, and High-Res Interpolated Cloud.
+    Features: Dual-Panel Interactive Dashboard, PFT Analysis, Fixed Axes, High-Res Interpolated Cloud, and Wave Optics IFFT.
     """
     
-    # Cache for the structured mesh topology (Legacy, kept for structure but unused in smooth render)
     _cached_triangles = None
     _cached_ray_count = 0
 
@@ -32,21 +31,30 @@ class Draw:
         n_time_steps = len(tracer.snapshots)
         
         include_beam = kwargs.get('draw_beam_arrow', False)
-        # Calculate global bounds once so the view is stable
         global_xlim, global_ylim = Draw._get_global_bounds(manager, tracer, include_beam=include_beam)
 
         plt.ioff()
-        fig = plt.figure(figsize=(9, 9)) 
+        
+        # --- WAVE OPTICS TOGGLE: Dynamic Dashboard Layout ---
+        is_wave = getattr(tracer, 'mode', 'geometric') == 'wave'
+        n_rows = 3 if is_wave else 2
+        height_ratios = [2, 1, 1] if is_wave else [2, 1]
+        fig_height = 12 if is_wave else 9
+        
+        fig = plt.figure(figsize=(9, fig_height)) 
 
-        # Layout: Global on top, Chirp/PFT side-by-side on bottom
-        gs = fig.add_gridspec(2, 2, height_ratios=[2, 1], width_ratios=[1, 1], 
+        gs = fig.add_gridspec(n_rows, 2, height_ratios=height_ratios, width_ratios=[1, 1], 
                               left=0.12, right=0.90, top=0.95, bottom=0.10, hspace=0.3, wspace=0.35)
         
         ax_global = fig.add_subplot(gs[0, :])
         ax_chirp = fig.add_subplot(gs[1, 0])
         ax_pft = fig.add_subplot(gs[1, 1])
         
-        # Disable mouse interaction on diagnostics (Zoom/Pan won't work on them, which is good)
+        ax_time = None
+        if is_wave:
+            ax_time = fig.add_subplot(gs[2, :])
+            ax_time.set_navigate(False)
+        
         ax_chirp.set_navigate(False)
         ax_pft.set_navigate(False)
         
@@ -54,38 +62,30 @@ class Draw:
         fig.canvas.footer_visible = False
         plt.ion()
 
-        # --- THE FIX: MONKEY-PATCH THE TOOLBAR HOME BUTTON ---
-        # We define a custom function that ONLY resets ax_global
         def custom_home_action(*args, **kwargs):
             ax_global.set_xlim(global_xlim)
             ax_global.set_ylim(global_ylim)
             ax_global.set_aspect('equal', adjustable='datalim')
             fig.canvas.draw_idle()
-            # Note: We intentionally do NOT touch ax_chirp or ax_pft here.
             
-        # Apply the patch to the toolbar instance
         try:
             if fig.canvas.toolbar:
                 fig.canvas.toolbar.home = custom_home_action
         except Exception:
-            pass # Toolbar might not exist in some backends
+            pass 
 
-        # Define Sliders & Controls
         s_source = widgets.IntSlider(min=-1, max=n_sources-1, step=1, value=-1, description='Source ID:', layout=widgets.Layout(width='100%'))
         s_time = widgets.IntSlider(min=-1, max=n_time_steps-1, step=1, value=-1, description='Time Step:', layout=widgets.Layout(width='100%'))
         c_cloud = widgets.Checkbox(value=False, description='Show Smooth Cloud')
 
-        # State tracking
         current_view = {'xlim': global_xlim, 'ylim': global_ylim}
         first_draw = [True]
 
         def update_dashboard(change=None):
-            # Read values
             source_idx = s_source.value
             time_idx = s_time.value
             show_cloud = c_cloud.value
 
-            # Persist Zoom (only for Global Plot)
             if not first_draw[0]:
                 current_view['xlim'] = ax_global.get_xlim()
                 current_view['ylim'] = ax_global.get_ylim()
@@ -93,6 +93,7 @@ class Draw:
             ax_global.clear()
             ax_chirp.clear()
             ax_pft.clear()
+            if ax_time is not None: ax_time.clear()
             
             filter_val = None if source_idx == -1 else source_idx
             
@@ -128,20 +129,28 @@ class Draw:
 
             Draw._draw_metrics_overlay(ax_global, snap_to_analyze, tracer, filter_val)
 
+            # --- WAVE OPTICS: TEMPORAL PULSE ---
+            if ax_time is not None:
+                if time_idx == -1:
+                    ax_time.set_axis_on()
+                    Draw.plot_temporal_pulse(ax_time, tracer, source_filter=filter_val)
+                else:
+                    ax_time.text(0.5, 0.5, "Temporal profile available in Integrated view (Time Step: -1)", ha='center', va='center')
+                    ax_time.set_axis_off()
+
             # --- RESTORE VIEW ---
             ax_global.set_aspect('equal', adjustable='datalim') 
             ax_global.autoscale(False)
             ax_global.set_xlim(current_view['xlim'])
             ax_global.set_ylim(current_view['ylim'])
             
-            # Autoscale diagnostics (since we cleared them, this resets them to data)
             ax_chirp.relim(); ax_chirp.autoscale_view()
             ax_pft.relim(); ax_pft.autoscale_view()
+            if ax_time is not None: ax_time.relim(); ax_time.autoscale_view()
             
             first_draw[0] = False
             fig.canvas.draw_idle()
 
-        # Connect Observers
         s_source.observe(update_dashboard, names='value')
         s_time.observe(update_dashboard, names='value')
         c_cloud.observe(update_dashboard, names='value')
@@ -153,6 +162,153 @@ class Draw:
         ]))
         
         update_dashboard()
+
+    # ------------------------------------------------------------------
+    #   NEW: WAVE OPTICS IFFT (TEMPORAL PULSE)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def plot_temporal_pulse(ax, tracer, source_filter=None):
+        """Extracts the temporal envelope of the pulse using an Inverse Fast Fourier Transform (IFFT)."""
+        df = tracer.rays
+        if source_filter is not None:
+            df = df[df['source_id'] == source_filter]
+            
+        if 'wavelength' not in df.columns or 'phase' not in df.columns:
+            ax.text(0.5, 0.5, "Wave optics data missing", ha='center', va='center')
+            return
+
+        wls_um = df['wavelength'].values
+        phases = df['phase'].values
+        opl_mm = df['opl'].values
+        
+        if len(wls_um) < 5:
+            ax.text(0.5, 0.5, "Not enough rays for IFFT", ha='center', va='center')
+            return
+            
+        c_um_ps = 299.792458
+        c_mm_ps = 0.299792458
+        nu_THz = c_um_ps / wls_um
+        
+        # 1. Carrier Group Delay Removal (Centers the pulse in the FFT window)
+        t_arrival_ps = opl_mm / c_mm_ps
+        t_0 = np.mean(t_arrival_ps)
+        phases_rel = phases - 2.0 * np.pi * nu_THz * t_0
+        
+        # 2. Grid Setup
+        N = 16384  # High resolution
+        nu_min, nu_max = np.min(nu_THz), np.max(nu_THz)
+        nu_center = (nu_max + nu_min) / 2.0
+        nu_span = max(nu_max - nu_min, 0.1)
+        
+        # Pad frequency significantly to increase time-domain resolution
+        pad_factor = 3.0
+        nu_grid = np.linspace(nu_center - pad_factor*nu_span, nu_center + pad_factor*nu_span, N)
+        dnu = nu_grid[1] - nu_grid[0]
+        
+        # 3. Re-Interpolation (Upsampling to kill Aliasing)
+        from scipy.interpolate import interp1d
+        from scipy.optimize import curve_fit
+        
+        # Sort the rays by frequency so interpolation works correctly
+        sort_idx = np.argsort(nu_THz)
+        nu_sorted = nu_THz[sort_idx]
+        phase_sorted = phases_rel[sort_idx]
+
+        # --- THE FIX: Coherent Addition of Duplicate Frequencies ---
+        # Find unique frequencies. If duplicates exist, coherently sum their complex fields.
+        nu_unique, inv_idx = np.unique(nu_sorted, return_inverse=True)
+        E_combined = np.zeros(len(nu_unique), dtype=complex)
+        np.add.at(E_combined, inv_idx, np.exp(1j * phase_sorted))
+        
+        # Extract the new, uniquely defined phase
+        phase_unique = np.angle(E_combined)
+
+        # Unwrap the phase so it is a continuous, smooth mathematical curve
+        phase_unwrapped = np.unwrap(phase_unique)
+
+        # Create smooth Cubic Spline functions for Phase. 
+        phase_interp = interp1d(nu_unique, phase_unwrapped, kind='cubic', bounds_error=False, fill_value=0)
+        amp_interp = interp1d(nu_unique, np.ones_like(nu_unique), kind='linear', bounds_error=False, fill_value=0)
+
+        # Apply the interpolators to our massive, high-resolution grid
+        E_nu = amp_interp(nu_grid) * np.exp(1j * phase_interp(nu_grid))
+            
+        # 4. Perform Baseband-Shifted IFFT
+        E_nu_baseband = np.fft.ifftshift(E_nu)
+        E_t = np.fft.ifftshift(np.fft.ifft(E_nu_baseband))
+        t_grid_ps = np.fft.ifftshift(np.fft.fftfreq(N, dnu))
+        t_grid_fs = t_grid_ps * 1000.0
+        
+        I_t = np.abs(E_t)**2
+        if np.max(I_t) > 0:
+            I_t /= np.max(I_t)
+            
+        # 5. Plotting (Raw Data)
+        ax.plot(t_grid_fs, I_t, color='purple', lw=1.5, alpha=0.7, label='Raw IFFT')
+        ax.fill_between(t_grid_fs, 0, I_t, color='purple', alpha=0.2)
+        
+        # 6. Super-Gaussian Envelope Fit & Smart Zoom
+        def super_gaussian(x, a, mu, sigma, n):
+            # n controls the "squareness". n=1 is standard Gaussian. n>3 is flat-top.
+            exponent = 0.5 * np.abs((x - mu) / sigma)**(2 * n)
+            return a * np.exp(-np.clip(exponent, 0, 100)) # Clip to prevent overflow
+
+        try:
+            # Estimate initial parameters
+            mean_guess = np.average(t_grid_fs, weights=I_t)
+            var_guess = np.average((t_grid_fs - mean_guess)**2, weights=I_t)
+            std_guess = np.sqrt(var_guess)
+            
+            # Fit with bounds: a in [0, 2], mu unconstrained, sigma > 0, n in [1, 15]
+            popt, _ = curve_fit(super_gaussian, t_grid_fs, I_t, 
+                                p0=[1.0, mean_guess, std_guess, 3.0],
+                                bounds=([0, -np.inf, 1e-6, 1.0], [2.0, np.inf, np.inf, 15.0]))
+            
+            a_fit, mu_fit, sigma_fit, n_fit = popt
+            
+            # Generate and plot the smooth curve
+            fit_y = super_gaussian(t_grid_fs, a_fit, mu_fit, sigma_fit, n_fit)
+            
+            # Force the envelope to peak at 1.0 to match the normalized raw data
+            if np.max(fit_y) > 0:
+                fit_y = fit_y / np.max(fit_y)
+            
+            # Plot the fitted envelope
+            label_text = f'Super-Gaussian (n={n_fit:.1f})' if n_fit > 1.2 else 'Gaussian Envelope'
+            ax.plot(t_grid_fs, fit_y, 'k--', lw=2.5, label=label_text)
+            
+            # Calculate FWHM for a Super-Gaussian: 2 * sigma * (2 * ln(2))^(1 / 2n)
+            fwhm_fs = 2.0 * sigma_fit * (2.0 * np.log(2))**(1.0 / (2.0 * n_fit))
+            
+            ax.text(0.02, 0.95, f"Fit FWHM: {fwhm_fs:.1f} fs", transform=ax.transAxes, 
+                    bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray'), va='top', fontweight='bold', fontsize=10)
+            
+            # Smart Zoom: strictly to +/- 2 FWHM around the pulse center
+            zoom_span = fwhm_fs * 2.0
+            ax.set_xlim(mu_fit - zoom_span, mu_fit + zoom_span)
+            ax.legend(loc='upper right', fontsize=9)
+            
+        except Exception:
+            # Fallback if the fit fails completely
+            above_thresh = np.where(I_t > 0.05)[0]
+            if len(above_thresh) > 0:
+                t_min = t_grid_fs[above_thresh[0]]
+                t_max = t_grid_fs[above_thresh[-1]]
+                span = max(t_max - t_min, 100.0)
+                ax.set_xlim(t_min - span*0.5, t_max + span*0.5)
+            else:
+                ax.set_xlim(-500, 500)
+                
+            above_half = np.where(I_t >= 0.5)[0]
+            if len(above_half) > 1:
+                fwhm_fs = t_grid_fs[above_half[-1]] - t_grid_fs[above_half[0]]
+                ax.text(0.02, 0.95, f"Raw FWHM: {fwhm_fs:.1f} fs", transform=ax.transAxes, 
+                        bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray'), va='top', fontweight='bold', fontsize=10)
+
+        ax.set_xlabel(f"Time relative to {t_0:.2f} ps [fs]")
+        ax.set_ylabel("Intensity [a.u.]")
+        ax.set_title("Temporal Pulse Profile (IFFT)", fontweight='bold')
+        ax.grid(True, linestyle=':', alpha=0.6)
         
     # ------------------------------------------------------------------
     #   NEW: SMOOTH GRID INTERPOLATION
@@ -179,27 +335,20 @@ class Draw:
         y = snap['y'][indices]
         wls = all_wls[active_ids]
         
-        # 1. Define Grid
-        # Add small padding to prevent cutoffs
         pad_x = (x.max() - x.min()) * 0.05
         pad_y = (y.max() - y.min()) * 0.05
-        xi = np.linspace(x.min() - pad_x, x.max() + pad_x, 150) # 150x150 resolution
+        xi = np.linspace(x.min() - pad_x, x.max() + pad_x, 150) 
         yi = np.linspace(y.min() - pad_y, y.max() + pad_y, 150)
         Xi, Yi = np.meshgrid(xi, yi)
         
-        # 2. Interpolate Wavelengths onto Grid
-        # 'cubic' gives the smoothest look. 'linear' is faster but pointier.
         try:
             zi = griddata((x, y), wls, (Xi, Yi), method='cubic')
         except:
-            return # Not enough points for cubic
+            return 
 
-        # 3. Plot Contours
         norm = mcolors.Normalize(vmin=wls.min(), vmax=wls.max())
-        # Use contourf for smooth filled color
         ax.contourf(Xi, Yi, zi, levels=100, cmap='jet', norm=norm, alpha=0.8, extend='both')
         
-        # 4. Add Mean Velocity Vector
         vx, vy = snap['vx'][indices], snap['vy'][indices]
         cx, cy = np.mean(x), np.mean(y)
         mvx, mvy = np.mean(vx), np.mean(vy)
@@ -277,15 +426,12 @@ class Draw:
         id_to_source = tracer.rays['source_id'].values
         global_ids = snap['ids']
         
-        # --- Logic for Single Source vs All Sources ---
         if source_filter is not None:
-            # SINGLE SOURCE MODE
             mask = (id_to_source[global_ids] == source_filter)
             pft_title = f"Pulse Front Curvature (Source #{source_filter})"
             ax_chirp.clear(); ax_chirp.text(0.5, 0.5, "N/A for Point Source", ha='center'); ax_chirp.axis('off')
             chirp_mode = False
         else:
-            # ALL SOURCES MODE
             mask = np.ones(len(global_ids), dtype=bool)
             pft_title = "Pulse Front Tilt (w/ Spatial Chirp)"
             chirp_title = "Longitudinal Chirp (De-Tilted)"
@@ -297,7 +443,6 @@ class Draw:
             if chirp_mode: ax_chirp.text(0.5, 0.5, "No active rays", ha='center'); ax_pft.text(0.5, 0.5, "No active rays", ha='center')
             return
 
-        # 1. Get Raw Data in Local Coordinates
         x, y = snap['x'][indices], snap['y'][indices]
         vx, vy = snap['vx'][indices], snap['vy'][indices]
         wls = tracer.rays['wavelength'][global_ids[indices]].values
@@ -313,12 +458,10 @@ class Draw:
         dt_fs = -(z_prime / c_mm_ps) * 1000.0 
         x_range = x_prime.max() - x_prime.min()
 
-        # 2. Perform Fit (Logic Split: Linear vs Quadratic)
         tilt_val = 0.0
         wl_chirp_val = 0.0
         fit_success = False
         
-        # --- PLOT 1: SPATIAL FRONT (PFT) ---
         ax_pft.scatter(x_prime, dt_fs, c=wls, cmap='jet', alpha=0.6, s=15, edgecolors='none')
         
         if x_range > 1e-4:
@@ -326,8 +469,6 @@ class Draw:
                 stats_text = ""
                 
                 if source_filter is not None:
-                    # === SINGLE SOURCE: QUADRATIC FIT ===
-                    # Use standard 1D polyfit (Degree 2)
                     coeffs = np.polyfit(x_prime, dt_fs, 2)
                     curv, tilt_val, intercept = coeffs[0], coeffs[1], coeffs[2]
                     
@@ -335,12 +476,9 @@ class Draw:
                     fit_y = np.polyval(coeffs, fit_x)
                     
                     stats_text = f"Curvature: {curv:.2f} fs/mm²"
-                    fit_success = True # Single source doesn't populate global chirp vars, but that's ok (chirp plot is off)
+                    fit_success = True 
 
                 else:
-                    # === ALL SOURCES: LINEAR FIT ===
-                    # Use Multivariate Linear Regression (drop x^2 term)
-                    # Model: dt = Tilt*x + Chirp*lambda + Offset
                     A = np.vstack([x_prime, wls, np.ones(len(x_prime))]).T
                     coeffs, _, _, _ = np.linalg.lstsq(A, dt_fs, rcond=None)
                     
@@ -348,16 +486,13 @@ class Draw:
                     wl_chirp_val = coeffs[1]  # fs/um
                     intercept = coeffs[2]
                     
-                    # Plot Linear Fit (at center wavelength)
                     center_wl = np.mean(wls)
                     fit_x = np.linspace(x_prime.min(), x_prime.max(), 50)
                     fit_y = tilt_val * fit_x + wl_chirp_val * center_wl + intercept
                     
-                    # Calculate Stats
                     c_mm_fs = 0.00029979
                     tilt_deg = np.degrees(np.arctan(tilt_val * c_mm_fs))
                     
-                    # Calculate Spatial Dispersion (for legend)
                     spat_chirp_val = 0.0
                     active_sids = id_to_source[global_ids[indices]]
                     total_slope, count = 0.0, 0
@@ -371,7 +506,6 @@ class Draw:
                     stats_text = f"Tilt: {tilt_deg:.2f}°\nDispersion: {spat_chirp_val:.2f} mm/μm"
                     fit_success = True
 
-                # Draw the line
                 ax_pft.plot(fit_x, fit_y, 'k--', lw=2, label=stats_text)
                 ax_pft.legend(loc='best', fontsize=9, framealpha=0.85)
 
@@ -389,14 +523,11 @@ class Draw:
         ax_pft.set_xlim(x_prime.min() - x_pad, x_prime.max() + x_pad)
         ax_pft.set_ylim(dt_fs.min() - y_pad, dt_fs.max() + y_pad)
 
-        # --- PLOT 2: LONGITUDINAL CHIRP (De-Tilted) ---
         if chirp_mode and fit_success:
-            # Subtract the linear geometric tilt we just found
             dt_fs_detilted = dt_fs - (tilt_val * x_prime)
             
             ax_chirp.scatter(wls, dt_fs_detilted, c='blue', alpha=0.2, s=5)
             
-            # Binning
             n_bins = 12
             valid_centers, mean_dts = [], []
             if wls.max() > wls.min():
@@ -411,7 +542,6 @@ class Draw:
 
                 if len(valid_centers) > 1:
                     ax_chirp.plot(valid_centers, mean_dts, 'ro', markersize=6, alpha=0.8)
-                    # Plot fit line using the coefficient (wl_chirp_val)
                     fit_w = np.linspace(wls.min(), wls.max(), 50)
                     fit_t = wl_chirp_val * (fit_w - np.mean(wls)) + np.mean(dt_fs_detilted)
                     ax_chirp.plot(fit_w, fit_t, 'r-', lw=2, alpha=0.8, label=f"Chirp: {wl_chirp_val:.0f} fs/μm")
@@ -475,7 +605,6 @@ class Draw:
             f"Total Span: {total_span}"
         )
         
-        # Place it in the top-left corner of the global plot
         ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes, 
                 fontsize=9, va='top', ha='left', family='monospace',
                 bbox=dict(facecolor='white', alpha=0.85, edgecolor='#cccccc', boxstyle='round,pad=0.5', zorder=20))
