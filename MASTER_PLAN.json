@@ -1,22 +1,45 @@
 {
+  "config": {
+    "default_model": "gemini-3.1-pro",
+    "supported_models": [
+      "gemini-3.1-pro",
+      "claude-opus-4.6",
+      "gemini-deep-think"
+    ]
+  },
   "tasks": [
     {
-      "id": "Task_1_Engine_Validation",
-      "complexity_score": "2/10",
-      "starting_ai_model": "gemini",
-      "handoff_ai_model": "claude",
-      "description": "DO NOT modify existing SPR logic. Create a standalone function `run_4G_baseline()`. Setup a 4-grating Martinez/Treacy compressor (groove_density=100, diameter=50.8). G1 orientation_angle=-30. G2 parallel to G1, 180mm apart. G3 symmetric inverse (orientation_angle=30). G4 parallel to G3, 180mm apart. Inject 3 superimposed rays (9.5, 10.0, 10.5 um) at orientation_angle=90. Verify spatial recombination after G4. Document results in task_1_summary.md and include ![Setup](./1000009165.png).",
-      "#_agent_handoff_loops": 1,
-      "target_file": "task_1_summary.md"
+      "id": "Task_1.1_Delete_Current_Optics",
+      "complexity": "1/10",
+      "starting_ai_model": "gemini-3.1-pro",
+      "handoff_ai_model": "claude-opus-4.6",
+      "overarching_goal": "Before we simulate the complex diverging Smith-Purcell Radiation (SPR), we must validate the custom ray-tracing engine. We are doing this by constructing a standard, textbook 4-grating Treacy compressor. The goal is to prove the engine can accurately calculate spatial recombination of different wavelengths.", 
+      "task_description": "Delete all the current optics under the build_system function. Start with nothing",
+      "handoff_description": "Look over the build_system function and determine if all optics inside have been properly deleted. There should be no optics at the moment.",
+      "#_agent_handoff_loops": 0,
+      "target_file": "task_1_1.md"
     },
     {
-      "id": "Task_2_SPR_Optimization",
-      "complexity_score": "8/10",
-      "starting_ai_model": "gemini",
-      "handoff_ai_model": "claude",
-      "description": "Transition to the actual SPR bench. Optimize G1 and G2 parameters (orientation_angle, x_center, y_center) to achieve temporal compression (Positive GDD) for the negatively chirped SPR pulse. Ensure the diffracted radiation is NOT normal to the grating face (must be physically realizable). Run with --opt_compressor --wave and document the math in task_2_summary.md.",
+      "id": "Task_1.2_Build_Source",
+      "complexity": "5/10",
+      "starting_ai_model": "gemini-3.1-pro",
+      "handoff_ai_model": "claude-opus-4.6",
+      "overarching_goal": "Before we simulate the complex diverging Smith-Purcell Radiation (SPR), we must validate the custom ray-tracing engine. We are doing this by constructing a standard, textbook 4-grating Treacy compressor. The goal is to prove the engine can accurately calculate spatial recombination of different wavelengths.",
+      "task_description": "Create a single source under the build_system framework. Then make sure the source logic is fleshed out. What I would like to see is the ability to define a generic source of light with input variables defined as # of rays, wavelengths, and propagation direction. The Once the source architecture can be implemented for the start of the ray trace, the # of rays I want to use will be 3. I want the wavelengths to be 9.5, 10, and 10.5 um, and I want them to be initially all superimposed on top of each other traveling in the +y-direction (orientiation_angle=90 deg). Define the starting position or source position as (0,0).",
+      "handoff_description": "Critically review that a single source of light was implemented properly. Determine if 3 rays were inputted with wavelengths of 9.5, 10, 10.5 um, and the light will be traveling in the +y-direction (orientation_angle=90 deg). If the initial setup of the source is incorrect please fix it. Secondly, check the source code logic is sound. The source should emitted all at the same time, and the rays should be all pointing in the same direction. If the code is attempting to implement a time delay framework cause it thinks the source is an SPR source it should be ok still. But if there is a simple fix, without changing the underlying ray trace framework, try to resolve it.",
       "#_agent_handoff_loops": 1,
-      "target_file": "task_2_summary.md"
+      "target_file": "task_1_2.md"
+    },
+    {
+      "id": "Task_1.3_Add_Compressor_Gratings",
+      "complexity": "7/10",
+      "starting_ai_model": "gemini-3.1-pro",
+      "handoff_ai_model": "claude-opus-4.6",
+      "task_description": "I want to define a 4 grating compressor. To start the radiation from the source will be traveling from (0,0) upwards in the xy-plane. I want to define 4 grating positions in a similar fashion to the picture attached below:",
+      "handoff_description": "Critically review that a single source of light was implemented properly. Determine if 3 rays were inputted with wavelengths of 9.5, 10, 10.5 um, and the light will be traveling in the +y-direction (orientation_angle=90 deg). If the initial setup of the source is incorrect please fix it. Secondly, check the source code logic is sound. The source should emitted all at the same time, and the rays should be all pointing in the same direction. If the code is attempting to implement a time delay framework cause it thinks the source is an SPR source it should be ok still. But if there is a simple fix, without changing the underlying ray trace framework, try to resolve it.",
+      "image_path": "C:/Users/rrudz/Downloads/1000009165.png",
+      "#_agent_handoff_loops": 1,
+      "target_file": "task_1_3.md"
     }
   ]
 }
