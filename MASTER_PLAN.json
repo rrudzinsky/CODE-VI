@@ -1,0 +1,16 @@
+{
+  "tasks": [
+    {
+      "id": "Task_1_Engine_Validation",
+      "description": "DO NOT modify existing SPR logic. Create a standalone function `run_4G_baseline()`. Setup a 4-grating Martinez/Treacy compressor (groove_density=100, diameter=50.8). G1 orientation_angle=-30. G2 parallel to G1, 180mm apart. G3 symmetric inverse (orientation_angle=30). G4 parallel to G3, 180mm apart. Inject 3 superimposed rays (9.5, 10.0, 10.5 um) at orientation_angle=90. Verify spatial recombination after G4. Document results in task_1_summary.md and include ![Setup](./1000009165.png).",
+      "iterations": 1,
+      "target_file": "task_1_summary.md"
+    },
+    {
+      "id": "Task_2_SPR_Optimization",
+      "description": "Transition to the actual SPR bench. Optimize G1 and G2 parameters (orientation_angle, x_center, y_center) to achieve temporal compression (Positive GDD) for the negatively chirped SPR pulse. Ensure the diffracted radiation is NOT normal to the grating face (must be physically realizable). Run with --opt_compressor --wave and document the math in task_2_summary.md.",
+      "iterations": 1,
+      "target_file": "task_2_summary.md"
+    }
+  ]
+}

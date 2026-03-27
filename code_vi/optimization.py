@@ -295,51 +295,186 @@ def plot_field_curvature(manager, lens2_name="Lens 2", search_window=50.0):
     
     return focal_points_x, focal_points_y
 
-def optimize_compressor_gratings(manager, g2_name="Grating 2", focal_plane_base=1000.0, angle_steps=5, offset_steps=5):
-    print("--- Hunting for Higher-Order Dispersion Null Point ---")
-    g1 = next(el for el in manager.elements if el.name == "Grating 1")
+def optimize_compressor_gratings(manager, g1_name="Grating 1", g2_name="Grating 2", show_plot=False):
+    g1 = next(el for el in manager.elements if el.name == g1_name)
     g2 = next(el for el in manager.elements if el.name == g2_name)
     
-    angles, offsets = np.linspace(-2.0, 2.0, angle_steps), np.linspace(-5.0, 5.0, offset_steps)
-    best_score, best_params = np.inf, (0, 0)
+    # Extract baseline
+    init_g1_y = g1.y_center
+    init_g2_x = g2.x_center
+    init_g2_y = g2.y_center
+    init_g2_angle = g2.orientation_angle
+
+    from code_vi.ray_trace import RayTracer
+    import numpy as np
+    import io
+    from contextlib import redirect_stdout
+    from scipy.optimize import minimize
+
+    # Setup Ray Tracer once
+    tracer_init = RayTracer(manager)
+    with redirect_stdout(io.StringIO()):
+        tracer_init.generate_smart_spr_source(
+            n_sources=5, rays_per_source=20, target_optic_name="Lens 2", 
+            grating_search_bounds=(0, 25.4), acceptance_angle_range=(70, 110), 
+            grating_period=10.0, beam_energy=0.99
+        )
+    # Handle module reloading safety
+    if hasattr(manager, '_save_ray_state'):
+        init_state = manager._save_ray_state(tracer_init)
+    else:
+        init_state = __import__('code_vi.optimization', fromlist=['_save_ray_state'])._save_ray_state(tracer_init)
     
-    for offset in offsets:
-        for angle in angles:
-            g1.y_center, g2.y_center, g2.orientation_angle = focal_plane_base + offset, (focal_plane_base - 25.0) + offset, angle
-            manager._calculate_surface_geometry(g1); manager._calculate_surface_geometry(g2)
+    n_total = len(init_state['x'])
+
+    print(f"--- AUTO-DETECTING BEAM REFERENCE FRAME ---")
+    # Temporarily banish Grating 2 so we can measure the free-flying diffracted beam
+    g2.x_center = 1e6
+    manager._calculate_surface_geometry(g2)
+
+    path_tracer = RayTracer(manager)
+    __import__('code_vi.optimization', fromlist=['_inject_fixed_rays'])._inject_fixed_rays(path_tracer, init_state, n_total)
+    for t in np.arange(0, 5000, 50.0): path_tracer.run_time_step(t, 50.0)
+
+    # Measure the exact centroid velocity of the rainbow leaving G1
+    path_snap = path_tracer.snapshots[-1]
+    beam_vx = np.mean(path_snap['vx'])
+    beam_vy = np.mean(path_snap['vy'])
+    beam_angle_rad = np.arctan2(beam_vy, beam_vx)
+    
+    print(f"   Diffracted Beam Angle: {np.degrees(beam_angle_rad):.2f}°")
+
+    # Restore Grating 2 and calculate the initial user separation distance
+    g2.x_center = init_g2_x
+    manager._calculate_surface_geometry(g2)
+    
+    dx_init = init_g2_x - g1.x_center
+    dy_init = init_g2_y - init_g1_y
+    init_separation = np.sqrt(dx_init**2 + dy_init**2)
+
+    print(f"\n--- INITIALIZING NESTED STEPPER OPTIMIZATION ---")
+    print(f" Starting G1 Y      : {init_g1_y:.3f} mm")
+    print(f" Starting Separation: {init_separation:.3f} mm (Distance along beam)")
+    print(f" Starting G2 Angle  : {init_g2_angle:.3f}°\n")
+
+    # ==========================================
+    # INNER LOOP: 2D Optimizer (Separation & Angle)
+    # ==========================================
+    def optimize_g2_for_given_g1(current_g1_y, guess_separation, guess_g2_angle):
+        g1.y_center = current_g1_y
+        manager._calculate_surface_geometry(g1)
+
+        def objective_g2(params):
+            separation, dg2_angle = params
             
+            # Penalize if it tries to put the grating too close, too far, or spin it wildly
+            if not (10.0 <= separation <= 800.0) or not (-15.0 <= dg2_angle <= 15.0):
+                return 1e12
+
+            # THE MAGIC: Lock Grating 2 onto the diagonal beam vector
+            g2.x_center = g1.x_center + separation * np.cos(beam_angle_rad)
+            g2.y_center = g1.y_center + separation * np.sin(beam_angle_rad)
+            g2.orientation_angle = guess_g2_angle + dg2_angle
+            manager._calculate_surface_geometry(g2)
+
             tracer = RayTracer(manager)
-            with redirect_stdout(io.StringIO()):
-                tracer.generate_smart_spr_source(
-                    n_sources=3, rays_per_source=10, target_optic_name="Lens 2", 
-                    grating_search_bounds=(0, 25.4), acceptance_angle_range=(70, 110), 
-                    grating_period=10.0, beam_energy=0.99
-                )
-            for t in np.arange(0, 5000, 100): tracer.run_time_step(t, 100)
-            
+            __import__('code_vi.optimization', fromlist=['_inject_fixed_rays'])._inject_fixed_rays(tracer, init_state, n_total)
+            for t in np.arange(0, 5000, 50.0): tracer.run_time_step(t, 50.0)
+
             snap = tracer.snapshots[-1]
-            if len(snap['ids']) < 5: continue
-            
+            if len(snap['ids']) < (n_total * 0.5): return 1e10
+
             vx, vy = snap['vx'], snap['vy']
             ray_angles = np.arctan2(vy, vx)
+            theta = np.mean(ray_angles)
             spatial_spread = np.std(ray_angles)
-            
-            x, y, theta = snap['x'], snap['y'], np.mean(ray_angles)
+
+            x, y = snap['x'], snap['y']
             dx, dy = x - np.mean(x), y - np.mean(y)
             z_prime = dx * np.cos(theta) + dy * np.sin(theta)
             dt_fs = -(z_prime / 0.29979) * 1000.0
-            
-            try: chirp_slope, _ = np.polyfit(tracer.rays['wavelength'].iloc[snap['ids']].values, dt_fs, 1)
-            except: continue
-                
-            score = (spatial_spread * 1000) + abs(chirp_slope)
-            if score < best_score: best_score, best_params = score, (angle, offset)
 
-    print(f"✅ Best Configuration -> Grating 2 Angle: {best_params[0]:5.2f}°, Offset: {best_params[1]:5.2f}mm")
+            wls = tracer._wavelength[snap['ids']]
+            try:
+                chirp_slope, _ = np.polyfit(wls, dt_fs, 1)
+            except:
+                return 1e9
+
+            return (spatial_spread * 1e7) + abs(chirp_slope)
+
+        # Hunt for the perfect distance and tilt
+        res = minimize(objective_g2, [guess_separation, 0.0], method='Nelder-Mead',
+                       bounds=((10.0, 800.0), (-15.0, 15.0)),
+                       options={'maxiter': 200, 'xatol': 1e-3, 'fatol': 1e-2})
+
+        best_separation = res.x[0]
+        best_g2_angle = guess_g2_angle + res.x[1]
+        
+        # Calculate the final absolute coordinates
+        best_g2_x = g1.x_center + best_separation * np.cos(beam_angle_rad)
+        best_g2_y = g1.y_center + best_separation * np.sin(beam_angle_rad)
+        
+        return best_separation, best_g2_angle, best_g2_x, best_g2_y, objective_g2(res.x)
+
+    # ==========================================
+    # OUTER LOOP: The Grating 1 Stepper Algorithm
+    # ==========================================
+    print(f">>> STEP 0: Evaluating Baseline Guess")
+    current_g1_y = init_g1_y
+    best_sep, best_g2_angle, best_g2_x, best_g2_y, best_score = optimize_g2_for_given_g1(current_g1_y, init_separation, init_g2_angle)
+    print(f"    Baseline Score: {best_score:.2f}\n")
+
+    step_size = 5.0  
+    direction = 1.0  
+
+    print(f">>> STEP 1: Testing Forward Direction (+{step_size} mm)")
+    test_g1_y = current_g1_y + (step_size * direction)
+    test_sep, test_g2_angle, test_g2_x, test_g2_y, test_score = optimize_g2_for_given_g1(test_g1_y, best_sep, best_g2_angle)
+
+    if test_score > best_score:
+        print(f"    Score worsened ({test_score:.2f} > {best_score:.2f}). Reversing direction!\n")
+        direction = -1.0
+        test_g1_y = current_g1_y + (step_size * direction)
+        print(f">>> STEP 1 (Reversed): Testing Backward Direction (-{step_size} mm)")
+        test_sep, test_g2_angle, test_g2_x, test_g2_y, test_score = optimize_g2_for_given_g1(test_g1_y, best_sep, best_g2_angle)
+    else:
+        print(f"    Correct direction found! Score improved to {test_score:.2f}\n")
+
+    step_count = 2
+    while test_score < best_score and step_count <= 15:
+        current_g1_y = test_g1_y
+        best_sep = test_sep
+        best_g2_angle = test_g2_angle
+        best_g2_x = test_g2_x
+        best_g2_y = test_g2_y
+        best_score = test_score
+
+        test_g1_y = current_g1_y + (step_size * direction)
+        print(f">>> STEP {step_count}: Marching to G1 Y = {test_g1_y:.2f} mm")
+        test_sep, test_g2_angle, test_g2_x, test_g2_y, test_score = optimize_g2_for_given_g1(test_g1_y, best_sep, best_g2_angle)
+        
+        if test_score < best_score:
+            print(f"    Improvement! Score dropped to {test_score:.2f}\n")
+        else:
+            print(f"    Score worsened ({test_score:.2f} > {best_score:.2f}). Bottom of the valley found!\n")
+            
+        step_count += 1
+
+    print(f"✅ STEPPER FINISHED. LOCKING BENCH:")
+    print(f"   Final G1 Y     : {current_g1_y:.3f} mm")
+    print(f"   Final G2 X,Y   : ({best_g2_x:.3f}, {best_g2_y:.3f}) mm")
+    print(f"   Final G2 Angle : {best_g2_angle:.3f}°")
+    print(f"   Separation Dist: {best_sep:.3f} mm")
+    print(f"   Final Score    : {best_score:.3f}")
+
+    g1.y_center = current_g1_y
+    manager._calculate_surface_geometry(g1)
+    g2.x_center = best_g2_x
+    g2.y_center = best_g2_y
+    g2.orientation_angle = best_g2_angle
+    manager._calculate_surface_geometry(g2) 
     
-    g1.y_center, g2.y_center, g2.orientation_angle = focal_plane_base + best_params[1], (focal_plane_base - 25.0) + best_params[1], best_params[0]
-    manager._calculate_surface_geometry(g1); manager._calculate_surface_geometry(g2)
-    return best_params
+    return current_g1_y, best_g2_x, best_g2_y, best_g2_angle, best_score
 
 def optimize_aspheric_profile(manager, lens_name="Lens 2", target_surface=1, show_plot=True):
     print(f"--- Optimizing Aspheric Profile for {lens_name} (Surface {target_surface}) ---")
