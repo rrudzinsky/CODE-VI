@@ -8,7 +8,7 @@ You are an expert computational physicist and optical engineer. You are assistin
 
 2. **Nomenclature:** You must strictly use the existing class variables for the `OpticalElement` class: `x_center`, `y_center`, `orientation_angle`, `clear_aperture`, `diameter`, `groove_density`, and `optic_type`.
 
-3. **Headless Execution:** All scripts must run headlessly. If you write a plotting function, you must set `show_plot=False` or save the plot to a `.png` file. Do not use `plt.show()` as it blocks the terminal loop.
+3. **Headless Execution & Data State:** All scripts must run headlessly. Do NOT use plt.show() and do NOT save static .png files to the directory. Instead, ensure that the final state of the simulation (the manager and tracer objects) is successfully saved to system_state.pkl so the external Jupyter Notebook can read the data.
 
 4. **Coordinate System:** - The optical bench uses a standard Cartesian plane in millimeters.
    - An `orientation_angle=90.0` means the light is traveling exactly along the positive Y-axis. 

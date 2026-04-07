@@ -44,6 +44,10 @@ def main():
         handoff_desc = task.get("handoff_description", "Please review the completed work for errors.")
         image_path = task.get("image_path", "")
         
+        # --- NEW: Extract and format the tags ---
+        tags = task.get("tags", [])
+        tags_string = " ".join(tags) + "\n\n" if tags else ""
+        
         # Clever check: If the markdown file already exists, the task is done!
         if target_file and os.path.exists(target_file):
             print(f"✅ [{task_id}] Skipped: '{target_file}' already exists.")
@@ -60,6 +64,7 @@ def main():
         prompt_1 = (
             f"Overarching Goal: {phase_goal}\n\n"
             f"Please complete the following specific task:\n\n"
+            f"{tags_string}"
             f"{description}\n\n"
             f"When finished, you must write your summary and results to {target_file}."
         )
@@ -69,23 +74,30 @@ def main():
             run_agent(starting_model, prompt_1, image_path)
             
             # ---------------------------------------------------------
-            # PHASE 2: Verification by Handoff Model
+            # PHASE 2: Verification by Handoff Model (Alternating)
             # ---------------------------------------------------------
             if handoff_loops > 0:
-                print(f"\n--- Phase 2: Handoff & Verification ({handoff_model}) ---")
+                print(f"\n--- Phase 2: Handoff & Verification ({handoff_loops} passes) ---")
                 
-                for loop_num in range(handoff_loops):
-                    print(f"Executing Handoff Loop {loop_num + 1}/{handoff_loops}...\n")
+                for pass_num in range(handoff_loops):
+                    # Alternate the reviewer model based on the pass number
+                    if pass_num % 2 == 0:
+                        current_reviewer = handoff_model
+                    else:
+                        current_reviewer = starting_model
+                        
+                    print(f"Executing Review Pass {pass_num + 1}/{handoff_loops} with {current_reviewer.upper()}...\n")
+                    
                     prompt_2 = (
                         f"You are reviewing a task just completed by another AI agent.\n\n"
-                        f"Original Task Context:\n{description}\n\n"
+                        f"Original Task Context:\n{tags_string}{description}\n\n"
                         f"Your Specific Review Instructions:\n{handoff_desc}\n\n"
                         f"Please read the results in {target_file} and the surrounding codebase. "
                         f"Make any necessary code corrections, and append your review notes to {target_file}."
                     )
                     
-                    # We do not pass the image to the reviewer here, just the code/markdown check
-                    run_agent(handoff_model, prompt_2)
+                    # Call the alternating reviewer
+                    run_agent(current_reviewer, prompt_2)
 
             print(f"\n🛑 {task_id} fully completed.")
             
